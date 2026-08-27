@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "moebius"
+version = "0.1.0"
+description = "State-based meta-RL manipulation experiments"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "gymnasium>=0.29",
+    "metaworld @ git+https://github.com/Farama-Foundation/Metaworld.git",
+    "numpy>=1.24",
+    "tensorboard>=2.14",
+    "torch>=2.2",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]
+
+[project.scripts]
+moebius-train = "moebius.train:main"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
