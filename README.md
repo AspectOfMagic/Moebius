@@ -56,7 +56,12 @@ moebius-record --checkpoint checkpoints/reach-v3_sac_seed1.pt --episodes 3
 ```
 
 Videos are written to `videos/`. Use `--video-dir` or `--fps` to change the
-output folder or frame rate.
+output folder or frame rate. Recording uses a top-down camera by default to
+keep the object visible. Other available camera angles include:
+
+```bash
+moebius-record --checkpoint checkpoints/reach-v3_sac_seed1.pt --camera-name corner2
+```
 
 The final checkpoint is saved to `checkpoints/`. Tests that do not require a
 MuJoCo installation can be run with:

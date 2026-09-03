@@ -20,6 +20,7 @@ class MetaWorldSingleTaskEnv(gym.Wrapper[np.ndarray, np.ndarray, np.ndarray, np.
         seed: int = 1,
         max_episode_steps: int = 500,
         render_mode: str | None = None,
+        camera_name: str | None = None,
     ) -> None:
         try:
             import metaworld  # noqa: F401 - importing registers Gymnasium environments
@@ -35,5 +36,6 @@ class MetaWorldSingleTaskEnv(gym.Wrapper[np.ndarray, np.ndarray, np.ndarray, np.
             seed=seed,
             max_episode_steps=max_episode_steps,
             render_mode=render_mode,
+            camera_name=camera_name,
         )
         super().__init__(environment)

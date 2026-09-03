@@ -18,6 +18,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--episodes", type=int, default=3)
     parser.add_argument("--video-dir", type=Path, default=Path("videos"))
     parser.add_argument("--fps", type=int, default=30)
+    parser.add_argument(
+        "--camera-name",
+        choices=("corner", "topview", "behindGripper", "gripperPOV", "corner2", "corner3", "corner4"),
+        default="topview",
+        help="MetaWorld camera to use. 'topview' provides the clearest overview of the object.",
+    )
     parser.add_argument("--device", default="auto", help="'auto', 'cpu', or a PyTorch device such as 'cuda'.")
     return parser.parse_args()
 
@@ -63,6 +69,7 @@ def record(args: argparse.Namespace) -> None:
         seed=int(config["seed"]),
         max_episode_steps=int(config["max_episode_steps"]),
         render_mode="rgb_array",
+        camera_name=args.camera_name,
     )
     actor = load_actor(checkpoint, environment, device)
     args.video_dir.mkdir(parents=True, exist_ok=True)
