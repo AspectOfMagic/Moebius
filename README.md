@@ -47,6 +47,17 @@ View training and evaluation metrics:
 tensorboard --logdir runs
 ```
 
+## Record a trained policy
+
+Record deterministic evaluation episodes from a saved checkpoint:
+
+```bash
+moebius-record --checkpoint checkpoints/reach-v3_sac_seed1.pt --episodes 3
+```
+
+Videos are written to `videos/`. Use `--video-dir` or `--fps` to change the
+output folder or frame rate.
+
 The final checkpoint is saved to `checkpoints/`. Tests that do not require a
 MuJoCo installation can be run with:
 

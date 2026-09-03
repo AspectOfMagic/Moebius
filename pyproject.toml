@@ -10,6 +10,7 @@ readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
     "gymnasium>=0.29",
+    "imageio[ffmpeg]>=2.31",
     "metaworld @ git+https://github.com/Farama-Foundation/Metaworld.git",
     "numpy>=1.24",
     "tensorboard>=2.14",
@@ -20,6 +21,7 @@ dependencies = [
 dev = ["pytest>=8.0"]
 
 [project.scripts]
+moebius-record = "moebius.record:main"
 moebius-train = "moebius.train:main"
 
 [tool.pytest.ini_options]
