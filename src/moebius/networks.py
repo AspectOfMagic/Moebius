@@ -18,18 +18,33 @@ def mlp(input_dim: int, output_dim: int, hidden_dim: int) -> nn.Sequential:
 
 
 class SquashedGaussianActor(nn.Module):
-    """Gaussian policy transformed into the environment's action bounds."""
+    """Gaussian policy transformed into the environment's action bounds.
 
-    def __init__(self, observation_dim: int, action_dim: int, hidden_dim: int, action_low: Tensor, action_high: Tensor) -> None:
+    ``latent_dim`` is zero for ordinary SAC and positive for PEARL, where the
+    policy receives a task latent in addition to the environment observation.
+    """
+
+    def __init__(
+        self,
+        observation_dim: int,
+        action_dim: int,
+        hidden_dim: int,
+        action_low: Tensor,
+        action_high: Tensor,
+        latent_dim: int = 0,
+    ) -> None:
         super().__init__()
-        self.backbone = mlp(observation_dim, hidden_dim, hidden_dim)
+        self.backbone = mlp(observation_dim + latent_dim, hidden_dim, hidden_dim)
         self.mean = nn.Linear(hidden_dim, action_dim)
         self.log_std = nn.Linear(hidden_dim, action_dim)
         self.register_buffer("action_scale", (action_high - action_low) / 2)
         self.register_buffer("action_bias", (action_high + action_low) / 2)
 
-    def forward(self, observation: Tensor, deterministic: bool = False) -> tuple[Tensor, Tensor]:
-        features = self.backbone(observation)
+    def forward(
+        self, observation: Tensor, latent: Tensor | None = None, deterministic: bool = False
+    ) -> tuple[Tensor, Tensor]:
+        inputs = observation if latent is None else torch.cat((observation, latent), dim=-1)
+        features = self.backbone(inputs)
         mean = self.mean(features)
         log_std = self.log_std(features).clamp(-20, 2)
         distribution = Normal(mean, log_std.exp())
@@ -44,10 +59,42 @@ class SquashedGaussianActor(nn.Module):
 
 
 class QNetwork(nn.Module):
-    def __init__(self, observation_dim: int, action_dim: int, hidden_dim: int) -> None:
+    """State-action value function, optionally conditioned on a PEARL latent."""
+
+    def __init__(self, observation_dim: int, action_dim: int, hidden_dim: int, latent_dim: int = 0) -> None:
         super().__init__()
-        self.network = mlp(observation_dim + action_dim, 1, hidden_dim)
+        self.network = mlp(observation_dim + action_dim + latent_dim, 1, hidden_dim)
 
-    def forward(self, observation: Tensor, action: Tensor) -> Tensor:
-        return self.network(torch.cat((observation, action), dim=-1))
+    def forward(self, observation: Tensor, action: Tensor, latent: Tensor | None = None) -> Tensor:
+        inputs = (observation, action) if latent is None else (observation, action, latent)
+        return self.network(torch.cat(inputs, dim=-1))
 
+
+class ContextEncoder(nn.Module):
+    """Infer a diagonal Gaussian task posterior from unordered transitions.
+
+    Each transition emits a Gaussian factor.  The factors are combined with a
+    unit-normal prior using a product of diagonal Gaussians, which is invariant
+    to the order of the context transitions and gives the prior for empty
+    context.
+    """
+
+    def __init__(self, context_dim: int, latent_dim: int, hidden_dim: int) -> None:
+        super().__init__()
+        self.latent_dim = latent_dim
+        self.network = mlp(context_dim, 2 * latent_dim, hidden_dim)
+
+    def forward(self, context: Tensor) -> tuple[Tensor, Tensor]:
+        """Return posterior mean and log variance for ``[tasks, context, features]``."""
+        if context.ndim != 3:
+            raise ValueError("Context must have shape [num_tasks, context_size, context_dim].")
+        parameters = self.network(context)
+        means, log_variances = parameters.chunk(2, dim=-1)
+        log_variances = log_variances.clamp(-10, 5)
+        precisions = torch.exp(-log_variances)
+
+        # Include p(z) = N(0, I) as one additional Gaussian factor.
+        posterior_precision = 1 + precisions.sum(dim=1)
+        posterior_variance = posterior_precision.reciprocal()
+        posterior_mean = posterior_variance * (precisions * means).sum(dim=1)
+        return posterior_mean, posterior_variance.log()

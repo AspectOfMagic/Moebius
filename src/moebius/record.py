@@ -64,6 +64,10 @@ def record(args: argparse.Namespace) -> None:
     device = "cuda" if args.device == "auto" and torch.cuda.is_available() else ("cpu" if args.device == "auto" else args.device)
     checkpoint = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
     config = checkpoint["config"]
+    if config.get("algorithm", "sac") != "sac":
+        raise ValueError(
+            "PEARL checkpoints require adaptation context during evaluation and are not supported by moebius-record yet."
+        )
     environment = MetaWorldSingleTaskEnv(
         env_name=config["env_name"],
         seed=int(config["seed"]),

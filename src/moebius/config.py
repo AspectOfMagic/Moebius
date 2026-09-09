@@ -6,8 +6,9 @@ from pathlib import Path
 
 @dataclass
 class TrainConfig:
-    """Configuration for a single-task Soft Actor-Critic run."""
+    """Configuration shared by the single-task SAC and Phase 2 PEARL runs."""
 
+    algorithm: str = "sac"
     env_name: str = "reach-v3"
     seed: int = 1
     total_steps: int = 250_000
@@ -24,10 +25,17 @@ class TrainConfig:
     critic_lr: float = 3e-4
     alpha_lr: float = 3e-4
     target_entropy: float | None = None
+    latent_dim: int = 5
+    encoder_lr: float = 3e-4
+    kl_weight: float = 0.1
+    num_train_tasks: int = 20
+    num_eval_tasks: int = 10
+    meta_batch_size: int = 8
+    context_size: int = 32
+    adaptation_episodes: int = 3
     max_episode_steps: int = 500
     eval_interval: int = 10_000
     eval_episodes: int = 10
     log_dir: Path = Path("runs")
     checkpoint_dir: Path = Path("checkpoints")
     device: str = "auto"
-
