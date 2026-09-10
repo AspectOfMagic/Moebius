@@ -99,6 +99,18 @@ Record deterministic evaluation episodes from a saved SAC checkpoint:
 moebius-record --checkpoint checkpoints/reach-v3_sac_seed1.pt --episodes 3
 ```
 
+Record PEARL's adaptation on one held-out task instead:
+
+```bash
+moebius-record --checkpoint checkpoints/reach-v3_pearl_seed1.pt \
+  --task-index 0 --adaptation-episodes 3
+```
+
+This produces one stochastic context-collection video per adaptation episode,
+followed by a deterministic `*_adapted.mp4` rollout using the inferred task
+latent. Omit `--adaptation-episodes` to use the value saved in the checkpoint.
+Use `--task-index` to select another held-out task configuration.
+
 Videos are written to `videos/`. Use `--video-dir` or `--fps` to change the
 output folder or frame rate. Recording uses a top-down camera by default to
 keep the object visible. Other available camera angles include:
