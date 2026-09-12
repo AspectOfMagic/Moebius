@@ -6,10 +6,13 @@ from pathlib import Path
 
 @dataclass
 class TrainConfig:
-    """Configuration shared by the single-task SAC and Phase 2 PEARL runs."""
+    """Configuration shared by the single-task SAC and PEARL runs."""
 
     algorithm: str = "sac"
-    env_name: str = "reach-v3"
+    # Phase 3's state-based manipulation target. Reset seeds define the
+    # object/goal configurations used as PEARL tasks; only the bookkeeping
+    # task identifier is omitted from the observation.
+    env_name: str = "pick-place-v3"
     seed: int = 1
     total_steps: int = 250_000
     start_steps: int = 10_000

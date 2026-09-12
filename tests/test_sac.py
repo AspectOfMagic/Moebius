@@ -1,6 +1,8 @@
 import numpy as np
 import torch
 
+from moebius.config import TrainConfig
+from moebius.envs import GoalTaskSampler
 from moebius.networks import ContextEncoder
 from moebius.pearl import PEARLAgent, context_from_batch
 from moebius.networks import SquashedGaussianActor
@@ -15,6 +17,17 @@ def test_actor_respects_action_bounds() -> None:
     assert log_probabilities.shape == (8, 1)
     assert torch.all(actions[:, 0] >= -2) and torch.all(actions[:, 0] <= 2)
     assert torch.all(actions[:, 1] >= -1) and torch.all(actions[:, 1] <= 3)
+
+
+def test_phase_three_defaults_to_pick_and_place_with_disjoint_task_configs() -> None:
+    assert TrainConfig().env_name == "pick-place-v3"
+    sampler = GoalTaskSampler(num_train_tasks=3, num_test_tasks=2, seed=7)
+
+    assert len(sampler.train_tasks) == 3
+    assert len(sampler.test_tasks) == 2
+    assert {task.reset_seed for task in sampler.train_tasks}.isdisjoint(
+        task.reset_seed for task in sampler.test_tasks
+    )
 
 
 def test_sac_update_produces_finite_metrics() -> None:

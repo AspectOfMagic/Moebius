@@ -1,8 +1,8 @@
 # Moebius
 
 State-based reinforcement-learning experiments for robot manipulation. Phase 1
-is a Soft Actor-Critic (SAC) baseline on one MetaWorld task; Phase 2 adds the
-core PEARL latent-task inference implementation.
+is a Soft Actor-Critic (SAC) baseline, Phase 2 adds PEARL latent-task
+inference, and Phase 3 applies that pipeline to MetaWorld pick-and-place.
 
 
 ## Included in Phase 1
@@ -11,13 +11,12 @@ core PEARL latent-task inference implementation.
 - Squashed Gaussian actor, twin Q critics, entropy temperature tuning, and
   Polyak-averaged target critics.
 - Replay buffer, training/evaluation loop, checkpoints, and TensorBoard logs.
-- Default task: `reach-v3`. Switch to another ML1 task using `--env-name`.
 
 ## Included in Phase 2 — PEARL core
 
-- A seeded ML1 goal-task distribution with disjoint meta-train/meta-test task
-  seeds. The task identifier is used only to organize replay data; it is never
-  supplied to the agent.
+- A seeded MT1 reset-configuration distribution with disjoint meta-train/
+  meta-test task seeds. The task identifier is used only to organize replay
+  data; it is never supplied to the agent.
 - A task-specific replay buffer for every meta-training task. Each update draws
   both a context set and an independent RL batch from the same task.
 - A permutation-invariant probabilistic context encoder
@@ -27,6 +26,15 @@ core PEARL latent-task inference implementation.
   `Q(s, a, z)`, with critic-driven encoder learning and KL regularization.
 - Adaptation evaluation that logs return and success before context and after
   each context-collection episode on held-out goal configurations.
+
+## Included in Phase 3 — Pick-and-place
+
+- `pick-place-v3` is now the default environment for both SAC and PEARL.
+  Switch to another MT1 task using `--env-name`.
+- Each seeded PEARL task reset selects a reproducible pick-and-place
+  configuration. This varies the object's starting placement and the target
+  configuration; the state observation continues to expose the robot, object,
+  and goal state, while the replay-buffer task identifier is never an input.
 
 ## Setup
 
@@ -51,24 +59,24 @@ Run a short smoke experiment first:
 moebius-train --total-steps 2000 --start-steps 500 --eval-interval 1000
 ```
 
-Then start the standard baseline run:
+Then start the Phase 3 SAC baseline:
 
 ```bash
-moebius-train --env-name reach-v3 --total-steps 250000
+moebius-train --total-steps 250000
 ```
 
-## Train PEARL on a simple task distribution
+## Train PEARL on pick-and-place
 
-This is intentionally the first PEARL milestone: the task differs by an ML1
-goal configuration, rather than by object mass/friction or pick-and-place.
-The agent must infer the configuration from transition context, then condition
-its policy on the inferred latent.
+The task differs by a seeded object/goal configuration. This phase validates
+the grasp, transport, and placement behavior with the existing PEARL training
+pipeline. Because this is state-based, the object and goal state are observed;
+mass and friction are still fixed and belong to Phase 4.
 
 ```bash
-moebius-train --algorithm pearl --env-name reach-v3 \
+moebius-train --algorithm pearl \
   --num-train-tasks 20 --num-eval-tasks 10 \
   --latent-dim 5 --context-size 32 --meta-batch-size 8 \
-  --total-steps 250000
+  --total-steps 1000000
 ```
 
 For a quick wiring check, shrink both training and meta-batch parameters so
@@ -96,13 +104,13 @@ adaptation signal.
 Record deterministic evaluation episodes from a saved SAC checkpoint:
 
 ```bash
-moebius-record --checkpoint checkpoints/reach-v3_sac_seed1.pt --episodes 3
+moebius-record --checkpoint checkpoints/pick-place-v3_sac_seed1.pt --episodes 3
 ```
 
 Record PEARL's adaptation on one held-out task instead:
 
 ```bash
-moebius-record --checkpoint checkpoints/reach-v3_pearl_seed1.pt \
+moebius-record --checkpoint checkpoints/pick-place-v3_pearl_seed1.pt \
   --task-index 0 --adaptation-episodes 3
 ```
 
@@ -116,7 +124,7 @@ output folder or frame rate. Recording uses a top-down camera by default to
 keep the object visible. Other available camera angles include:
 
 ```bash
-moebius-record --checkpoint checkpoints/reach-v3_sac_seed1.pt --camera-name corner2
+moebius-record --checkpoint checkpoints/pick-place-v3_sac_seed1.pt --camera-name corner2
 ```
 
 The final checkpoint is saved to `checkpoints/`. Tests that do not require a

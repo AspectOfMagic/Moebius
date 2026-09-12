@@ -17,9 +17,13 @@ from moebius.sac import SACAgent
 
 
 def parse_args() -> TrainConfig:
-    parser = argparse.ArgumentParser(description="Train SAC or PEARL on MetaWorld ML1 reach tasks.")
+    parser = argparse.ArgumentParser(description="Train SAC or PEARL on state-based MetaWorld manipulation tasks.")
     parser.add_argument("--algorithm", choices=("sac", "pearl"), default="sac")
-    parser.add_argument("--env-name", default="reach-v3")
+    parser.add_argument(
+        "--env-name",
+        default="pick-place-v3",
+        help="MetaWorld MT1 task (default: pick-place-v3).",
+    )
     parser.add_argument("--seed", type=int, default=1)
     parser.add_argument("--total-steps", type=int, default=250_000)
     parser.add_argument("--start-steps", type=int, default=10_000)
