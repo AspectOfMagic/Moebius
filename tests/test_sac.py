@@ -6,8 +6,9 @@ from moebius.envs import GoalTaskSampler
 from moebius.networks import ContextEncoder
 from moebius.pearl import PEARLAgent, context_from_batch
 from moebius.networks import SquashedGaussianActor
-from moebius.replay_buffer import MultiTaskReplayBuffer, ReplayBuffer
+from moebius.replay_buffer import MultiTaskReplayBuffer, ReplayBuffer, concatenate_batches
 from moebius.sac import SACAgent
+from moebius.train import demonstration_batch_sizes, online_bc_weight
 
 
 def test_actor_respects_action_bounds() -> None:
@@ -37,6 +38,29 @@ def test_sac_update_produces_finite_metrics() -> None:
     agent = SACAgent(3, np.full(2, -1.0), np.full(2, 1.0), hidden_dim=16)
     metrics = agent.update(buffer.sample(16))
     assert all(np.isfinite(value) for value in metrics.values())
+
+
+def test_demonstration_augmented_sac_updates_and_decays_bc_loss() -> None:
+    online = ReplayBuffer(3, 2, capacity=32)
+    demonstrations = ReplayBuffer(3, 2, capacity=32)
+    for _ in range(32):
+        online.add(np.random.randn(3), np.random.uniform(-1, 1, 2), 1.0, np.random.randn(3), False)
+        demonstrations.add(np.random.randn(3), np.random.uniform(-1, 1, 2), 1.0, np.random.randn(3), False)
+    agent = SACAgent(3, np.full(2, -1.0), np.full(2, 1.0), hidden_dim=16)
+
+    pretrain_metrics = agent.behavior_clone(demonstrations.sample(8))
+    demonstration_batch = demonstrations.sample(4)
+    mixed_batch = concatenate_batches(online.sample(8), demonstration_batch)
+    metrics = agent.update(mixed_batch, demonstration_batch, bc_weight=0.5)
+
+    assert all(np.isfinite(value) for value in pretrain_metrics.values())
+    assert all(np.isfinite(value) for value in metrics.values())
+    assert metrics["loss/bc"] >= 0
+    assert mixed_batch.observations.shape == (12, 3)
+    assert demonstration_batch_sizes(256, 0.25) == (192, 64)
+    assert online_bc_weight(TrainConfig(bc_weight=1.0, bc_decay_steps=100), 0) == 1.0
+    assert online_bc_weight(TrainConfig(bc_weight=1.0, bc_decay_steps=100), 50) == 0.5
+    assert online_bc_weight(TrainConfig(bc_weight=1.0, bc_decay_steps=100), 100) == 0.0
 
 
 def test_context_encoder_is_permutation_invariant() -> None:

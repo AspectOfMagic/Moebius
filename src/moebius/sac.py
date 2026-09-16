@@ -53,7 +53,23 @@ class SACAgent:
         action, _ = self.actor(observation_tensor, deterministic=deterministic)
         return action.squeeze(0).cpu().numpy()
 
-    def update(self, batch: Batch) -> dict[str, float]:
+    def behavior_clone(self, batch: Batch) -> dict[str, float]:
+        """Fit the deterministic actor action to expert actions in ``batch``."""
+        observations = self._tensor(batch.observations)
+        actions = self._tensor(batch.actions)
+        predicted_actions, _ = self.actor(observations, deterministic=True)
+        loss = F.mse_loss(predicted_actions, actions)
+        self.actor_optimizer.zero_grad()
+        loss.backward()
+        self.actor_optimizer.step()
+        return {"loss/bc": loss.item()}
+
+    def update(
+        self,
+        batch: Batch,
+        demonstration_batch: Batch | None = None,
+        bc_weight: float = 0.0,
+    ) -> dict[str, float]:
         observations = self._tensor(batch.observations)
         actions = self._tensor(batch.actions)
         rewards = self._tensor(batch.rewards)
@@ -74,7 +90,14 @@ class SACAgent:
 
         sampled_actions, log_prob = self.actor(observations)
         q_value = torch.minimum(self.q1(observations, sampled_actions), self.q2(observations, sampled_actions))
-        actor_loss = (self.alpha.detach() * log_prob - q_value).mean()
+        sac_actor_loss = (self.alpha.detach() * log_prob - q_value).mean()
+        bc_loss = torch.zeros((), device=self.device)
+        if demonstration_batch is not None and bc_weight > 0:
+            demo_observations = self._tensor(demonstration_batch.observations)
+            demo_actions = self._tensor(demonstration_batch.actions)
+            predicted_demo_actions, _ = self.actor(demo_observations, deterministic=True)
+            bc_loss = F.mse_loss(predicted_demo_actions, demo_actions)
+        actor_loss = sac_actor_loss + bc_weight * bc_loss
         self.actor_optimizer.zero_grad()
         actor_loss.backward()
         self.actor_optimizer.step()
@@ -87,6 +110,8 @@ class SACAgent:
         self._update_targets()
         return {
             "loss/actor": actor_loss.item(),
+            "loss/sac_actor": sac_actor_loss.item(),
+            "loss/bc": bc_loss.item(),
             "loss/critic": critic_loss.item(),
             "loss/alpha": alpha_loss.item(),
             "stats/alpha": self.alpha.item(),
@@ -111,4 +136,3 @@ class SACAgent:
         for source, target in ((self.q1, self.target_q1), (self.q2, self.target_q2)):
             for source_parameter, target_parameter in zip(source.parameters(), target.parameters()):
                 target_parameter.lerp_(source_parameter, self.tau)
-

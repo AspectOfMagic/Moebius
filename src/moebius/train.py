@@ -12,7 +12,7 @@ from torch.utils.tensorboard import SummaryWriter
 from moebius.config import TrainConfig
 from moebius.envs import GoalTaskSampler, MetaWorldSingleTaskEnv, TaskSpec
 from moebius.pearl import PEARLAgent, context_transition
-from moebius.replay_buffer import MultiTaskReplayBuffer, ReplayBuffer
+from moebius.replay_buffer import MultiTaskReplayBuffer, ReplayBuffer, concatenate_batches
 from moebius.sac import SACAgent
 
 
@@ -32,6 +32,36 @@ def parse_args() -> TrainConfig:
     parser.add_argument("--log-dir", type=Path, default=Path("runs"))
     parser.add_argument("--checkpoint-dir", type=Path, default=Path("checkpoints"))
     parser.add_argument("--device", default="auto", help="'auto', 'cpu', or a PyTorch device such as 'cuda'.")
+    parser.add_argument(
+        "--demo-episodes",
+        type=int,
+        default=0,
+        help="Successful scripted-expert rollouts to collect before SAC training; set to 0 for pure SAC.",
+    )
+    parser.add_argument(
+        "--bc-pretrain-updates",
+        type=int,
+        default=10_000,
+        help="Actor behavior-cloning updates on demonstrations before online SAC.",
+    )
+    parser.add_argument(
+        "--demo-batch-fraction",
+        type=float,
+        default=0.25,
+        help="Fraction of each online SAC update sampled from the permanent demonstration buffer.",
+    )
+    parser.add_argument(
+        "--bc-weight",
+        type=float,
+        default=1.0,
+        help="Initial behavior-cloning loss weight during online SAC fine-tuning.",
+    )
+    parser.add_argument(
+        "--bc-decay-steps",
+        type=int,
+        default=250_000,
+        help="Environment steps over which the online behavior-cloning loss decays to zero.",
+    )
     parser.add_argument("--latent-dim", type=int, default=5)
     parser.add_argument("--encoder-lr", type=float, default=3e-4)
     parser.add_argument("--kl-weight", type=float, default=0.1)
@@ -66,6 +96,90 @@ def evaluate(agent: SACAgent, environment: MetaWorldSingleTaskEnv, episodes: int
     return float(np.mean(returns)), float(np.mean(successes))
 
 
+def _pick_place_expert() -> object:
+    """Create the MetaWorld scripted policy used only for Phase 3 demos."""
+    try:
+        from metaworld.policies import SawyerPickPlaceV3Policy
+    except ImportError as error:
+        raise ImportError("MetaWorld's expert policies are required for demonstration-augmented SAC.") from error
+    return SawyerPickPlaceV3Policy()
+
+
+def collect_demonstrations(
+    config: TrainConfig,
+    observation_dim: int,
+    action_dim: int,
+    writer: SummaryWriter,
+) -> ReplayBuffer | None:
+    """Collect permanent, successful pick-and-place expert trajectories.
+
+    The expert environment is independent from evaluation and uses normal,
+    unseeded resets after construction, so it samples the training reset
+    distribution without exposing evaluation rollouts to the replay buffer.
+    """
+    if config.demo_episodes == 0:
+        return None
+    if config.demo_episodes < 0:
+        raise ValueError("--demo-episodes must be non-negative.")
+    if config.env_name != "pick-place-v3":
+        raise ValueError("Demonstration collection currently supports only --env-name pick-place-v3.")
+
+    capacity = config.demo_episodes * config.max_episode_steps
+    buffer = ReplayBuffer(observation_dim, action_dim, capacity, config.seed + 10_000)
+    environment = MetaWorldSingleTaskEnv(config.env_name, config.seed + 2, config.max_episode_steps)
+    expert = _pick_place_expert()
+    successful_episodes = 0
+    try:
+        for episode in range(config.demo_episodes):
+            observation, _ = environment.reset()
+            terminated = truncated = False
+            episode_return = 0.0
+            info: dict[str, float] = {}
+            while not (terminated or truncated):
+                action = np.asarray(expert.get_action(observation), dtype=np.float32)
+                # Scripted policies may rely on MetaWorld to clip their
+                # commands. Store the clipped action, since that is what the
+                # environment actually executes and what the actor can emit.
+                action = np.clip(action, environment.action_space.low, environment.action_space.high)
+                next_observation, reward, terminated, truncated, info = environment.step(action)
+                # Preserve MetaWorld's terminal semantics; a success flag does
+                # not necessarily end an episode in this environment.
+                buffer.add(observation, action, reward, next_observation, terminated)
+                observation = next_observation
+                episode_return += reward
+            success = float(info.get("success", False))
+            successful_episodes += int(success)
+            writer.add_scalar("demo/episode_return", episode_return, episode + 1)
+            writer.add_scalar("demo/success", success, episode + 1)
+    finally:
+        environment.close()
+
+    success_rate = successful_episodes / config.demo_episodes
+    writer.add_scalar("demo/success_rate", success_rate, 0)
+    if successful_episodes != config.demo_episodes:
+        raise RuntimeError(
+            f"Only {successful_episodes}/{config.demo_episodes} expert rollouts succeeded; refusing to use failed demonstrations."
+        )
+    return buffer
+
+
+def demonstration_batch_sizes(batch_size: int, fraction: float) -> tuple[int, int]:
+    if batch_size < 2:
+        raise ValueError("--batch-size must be at least 2 when using demonstrations.")
+    if not 0 < fraction < 1:
+        raise ValueError("--demo-batch-fraction must be strictly between 0 and 1.")
+    demo_size = min(batch_size - 1, max(1, round(batch_size * fraction)))
+    return batch_size - demo_size, demo_size
+
+
+def online_bc_weight(config: TrainConfig, step: int) -> float:
+    if config.bc_weight < 0:
+        raise ValueError("--bc-weight must be non-negative.")
+    if config.bc_decay_steps < 1:
+        raise ValueError("--bc-decay-steps must be positive.")
+    return config.bc_weight * max(0.0, 1.0 - step / config.bc_decay_steps)
+
+
 def train_sac(config: TrainConfig) -> None:
     set_seed(config.seed)
     device = "cuda" if config.device == "auto" and torch.cuda.is_available() else ("cpu" if config.device == "auto" else config.device)
@@ -91,10 +205,27 @@ def train_sac(config: TrainConfig) -> None:
     writer = SummaryWriter(config.log_dir / run_name)
     writer.add_text("config", str(asdict(config)))
 
+    demonstrations = collect_demonstrations(config, observation_dim, action_dim, writer)
+    if demonstrations is not None:
+        if config.bc_pretrain_updates < 0:
+            raise ValueError("--bc-pretrain-updates must be non-negative.")
+        if demonstrations.size < config.batch_size:
+            raise ValueError(
+                "Demonstration buffer is smaller than --batch-size; increase --demo-episodes or lower --batch-size."
+            )
+        for update in range(1, config.bc_pretrain_updates + 1):
+            metrics = agent.behavior_clone(demonstrations.sample(config.batch_size))
+            if update % 100 == 0 or update == config.bc_pretrain_updates:
+                writer.add_scalar("pretrain/bc_loss", metrics["loss/bc"], update)
+        writer.add_scalar("demo/transitions", demonstrations.size, 0)
+        online_batch_size, demo_batch_size = demonstration_batch_sizes(config.batch_size, config.demo_batch_fraction)
+
     observation, _ = environment.reset(seed=config.seed)
     episode_return, episode_length, episode = 0.0, 0, 0
     for step in range(1, config.total_steps + 1):
-        action = environment.action_space.sample() if step <= config.start_steps else agent.act(observation)
+        # Behavior cloning supplies a competent initial policy, replacing the
+        # random-action warm-up used by pure SAC.
+        action = agent.act(observation) if demonstrations is not None or step > config.start_steps else environment.action_space.sample()
         next_observation, reward, terminated, truncated, info = environment.step(action)
         done = terminated or truncated
         # Time limits are not environmental terminals and should bootstrap.
@@ -111,11 +242,22 @@ def train_sac(config: TrainConfig) -> None:
             episode_return, episode_length = 0.0, 0
             episode += 1
 
-        if step >= config.update_after and buffer.size >= config.batch_size and step % config.update_every == 0:
+        minimum_online_batch = online_batch_size if demonstrations is not None else config.batch_size
+        if step >= config.update_after and buffer.size >= minimum_online_batch and step % config.update_every == 0:
             for _ in range(config.update_every * config.updates_per_step):
-                metrics = agent.update(buffer.sample(config.batch_size))
+                if demonstrations is None:
+                    metrics = agent.update(buffer.sample(config.batch_size))
+                else:
+                    demo_batch = demonstrations.sample(demo_batch_size)
+                    metrics = agent.update(
+                        concatenate_batches(buffer.sample(online_batch_size), demo_batch),
+                        demo_batch,
+                        online_bc_weight(config, step),
+                    )
             for name, value in metrics.items():
                 writer.add_scalar(name, value, step)
+            if demonstrations is not None:
+                writer.add_scalar("schedule/bc_weight", online_bc_weight(config, step), step)
 
         if step % config.eval_interval == 0:
             evaluation_return, evaluation_success = evaluate(agent, evaluation_environment, config.eval_episodes)

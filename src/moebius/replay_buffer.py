@@ -15,6 +15,13 @@ class Batch:
     dones: np.ndarray
 
 
+def concatenate_batches(*batches: Batch) -> Batch:
+    """Join equally shaped transition batches along their sample dimension."""
+    if not batches:
+        raise ValueError("At least one batch is required.")
+    return Batch(*(np.concatenate([getattr(batch, field) for batch in batches], axis=0) for field in Batch.__dataclass_fields__))
+
+
 @dataclass
 class TaskBatch:
     """Independent context and RL samples for a batch of meta-training tasks.

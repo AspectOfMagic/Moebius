@@ -28,6 +28,13 @@ class TrainConfig:
     critic_lr: float = 3e-4
     alpha_lr: float = 3e-4
     target_entropy: float | None = None
+    # Set demo_episodes > 0 to enable the Phase 3 demonstration-augmented SAC
+    # protocol. The zero default preserves a pure-SAC baseline.
+    demo_episodes: int = 0
+    bc_pretrain_updates: int = 10_000
+    demo_batch_fraction: float = 0.25
+    bc_weight: float = 1.0
+    bc_decay_steps: int = 250_000
     latent_dim: int = 5
     encoder_lr: float = 3e-4
     kl_weight: float = 0.1

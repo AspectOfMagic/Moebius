@@ -35,6 +35,9 @@ inference, and Phase 3 applies that pipeline to MetaWorld pick-and-place.
   configuration. This varies the object's starting placement and the target
   configuration; the state observation continues to expose the robot, object,
   and goal state, while the replay-buffer task identifier is never an input.
+- Demonstration-augmented SAC can collect successful scripted-expert rollouts
+  across the training reset distribution, behavior-clone the actor, then mix
+  permanent demonstrations with online experience during SAC updates.
 
 ## Setup
 
@@ -59,10 +62,25 @@ Run a short smoke experiment first:
 moebius-train --total-steps 2000 --start-steps 500 --eval-interval 1000
 ```
 
-Then start the Phase 3 SAC baseline:
+Then start the Phase 3 demonstration-augmented SAC run:
 
 ```bash
-moebius-train --total-steps 250000
+moebius-train --algorithm sac --total-steps 1000000 \
+  --demo-episodes 100 --bc-pretrain-updates 10000 \
+  --demo-batch-fraction 0.25 --bc-weight 1.0 --bc-decay-steps 250000
+```
+
+The expert data is collected only from the training reset distribution and is
+kept in a separate, permanent replay buffer. Each online update contains 75%
+online transitions and 25% demonstrations; an additional behavior-cloning
+loss starts at weight 1.0 and linearly decays to zero over 250,000 environment
+steps. TensorBoard logs `demo/*`, `pretrain/bc_loss`, `loss/bc`, and
+`schedule/bc_weight`.
+
+To retain the original pure-SAC baseline, disable demonstrations explicitly:
+
+```bash
+moebius-train --algorithm sac --total-steps 1000000 --demo-episodes 0
 ```
 
 ## Train PEARL on pick-and-place
