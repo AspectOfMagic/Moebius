@@ -8,7 +8,7 @@ import imageio.v2 as imageio
 import numpy as np
 import torch
 
-from moebius.envs import GoalTaskSampler, MetaWorldSingleTaskEnv, TaskSpec
+from moebius.envs import DynamicsTaskSampler, GoalTaskSampler, MetaWorldSingleTaskEnv, TaskSpec
 from moebius.networks import SquashedGaussianActor
 from moebius.pearl import PEARLAgent, context_transition
 
@@ -94,6 +94,15 @@ def _append_context(context: list[np.ndarray], transition: np.ndarray, context_s
         del context[:-context_size]
 
 
+def _reset_task(environment: MetaWorldSingleTaskEnv, task: TaskSpec) -> np.ndarray:
+    environment.set_object_dynamics(task.mass_scale, task.friction_scale)
+    if task.reset_seed is None:
+        observation, _ = environment.reset()
+    else:
+        observation, _ = environment.reset(seed=task.reset_seed)
+    return observation
+
+
 def _append_frame(writer: imageio.Writer, environment: MetaWorldSingleTaskEnv) -> None:
     frame = environment.render()
     if frame is None:
@@ -130,7 +139,7 @@ def record_pearl_episode(
     deterministic: bool,
 ) -> tuple[float, bool]:
     """Record one context-collection or adapted PEARL rollout on one task."""
-    observation, _ = environment.reset(seed=task.reset_seed)
+    observation = _reset_task(environment, task)
     episode_return = 0.0
     terminated = truncated = False
     info: dict[str, Any] = {}
@@ -150,11 +159,22 @@ def record_pearl_episode(
 def record_pearl(
     agent: PEARLAgent, environment: MetaWorldSingleTaskEnv, config: dict[str, Any], args: argparse.Namespace
 ) -> None:
-    sampler = GoalTaskSampler(
-        num_train_tasks=int(config["num_train_tasks"]),
-        num_test_tasks=int(config["num_eval_tasks"]),
-        seed=int(config["seed"]),
-    )
+    if config.get("pearl_task_distribution", "goal") == "dynamics":
+        sampler = DynamicsTaskSampler(
+            num_train_tasks=int(config["num_train_tasks"]),
+            num_test_tasks=int(config["num_eval_tasks"]),
+            mass_scale_min=float(config.get("mass_scale_min", 0.5)),
+            mass_scale_max=float(config.get("mass_scale_max", 1.5)),
+            friction_scale_min=float(config.get("friction_scale_min", 0.5)),
+            friction_scale_max=float(config.get("friction_scale_max", 1.5)),
+            seed=int(config["seed"]),
+        )
+    else:
+        sampler = GoalTaskSampler(
+            num_train_tasks=int(config["num_train_tasks"]),
+            num_test_tasks=int(config["num_eval_tasks"]),
+            seed=int(config["seed"]),
+        )
     if not 0 <= args.task_index < len(sampler.test_tasks):
         raise ValueError(f"--task-index must be in [0, {len(sampler.test_tasks) - 1}].")
     adaptation_episodes = (

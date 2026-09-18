@@ -35,6 +35,13 @@ class TrainConfig:
     demo_batch_fraction: float = 0.25
     bc_weight: float = 1.0
     bc_decay_steps: int = 250_000
+    pearl_task_distribution: str = "dynamics"
+    mass_scale_min: float = 0.5
+    mass_scale_max: float = 1.5
+    friction_scale_min: float = 0.5
+    friction_scale_max: float = 1.5
+    pearl_demo_episodes_per_task: int = 2
+    pearl_bc_pretrain_updates: int = 5_000
     latent_dim: int = 5
     encoder_lr: float = 3e-4
     kl_weight: float = 0.1

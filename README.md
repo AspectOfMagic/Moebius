@@ -2,7 +2,8 @@
 
 State-based reinforcement-learning experiments for robot manipulation. Phase 1
 is a Soft Actor-Critic (SAC) baseline, Phase 2 adds PEARL latent-task
-inference, and Phase 3 applies that pipeline to MetaWorld pick-and-place.
+inference, Phase 3 applies that pipeline to MetaWorld pick-and-place, and
+Phase 4 introduces hidden object dynamics.
 
 
 ## Included in Phase 1
@@ -38,6 +39,19 @@ inference, and Phase 3 applies that pipeline to MetaWorld pick-and-place.
 - Demonstration-augmented SAC can collect successful scripted-expert rollouts
   across the training reset distribution, behavior-clone the actor, then mix
   permanent demonstrations with online experience during SAC updates.
+
+## Included in Phase 4 — Hidden object properties
+
+- Each PEARL task fixes an unobserved object mass scale and sliding-friction
+  scale. The default train/test range is 0.5–1.5 times MetaWorld's nominal
+  value, with independently sampled and disjoint train/test parameter pairs.
+- Object and goal positions are still randomized on every reset within each
+  task. This ensures that PEARL must infer dynamics from transitions rather
+  than using a visible configuration as a task label.
+- Before online training, MetaWorld's scripted pick-and-place expert collects
+  demonstrations for every training dynamics task. PEARL behavior-clones both
+  its actor and context encoder, then uses persistent per-task demonstrations
+  in mixed online/offline updates with a decaying cloning loss.
 
 ## Setup
 
@@ -83,27 +97,46 @@ To retain the original pure-SAC baseline, disable demonstrations explicitly:
 moebius-train --algorithm sac --total-steps 1000000 --demo-episodes 0
 ```
 
-## Train PEARL on pick-and-place
+## Train PEARL with hidden mass and friction
 
-The task differs by a seeded object/goal configuration. This phase validates
-the grasp, transport, and placement behavior with the existing PEARL training
-pipeline. Because this is state-based, the object and goal state are observed;
-mass and friction are still fixed and belong to Phase 4.
+Object and goal state is observable, but mass and sliding friction are not.
+The context encoder must infer useful dynamics information from `(s, a, r,
+s')` transitions. The expert demonstrations are restricted to training tasks;
+held-out dynamics are never added to a buffer.
 
 ```bash
-moebius-train --algorithm pearl \
+moebius-train --algorithm pearl --pearl-task-distribution dynamics \
   --num-train-tasks 20 --num-eval-tasks 10 \
   --latent-dim 5 --context-size 32 --meta-batch-size 8 \
+  --mass-scale-min 0.5 --mass-scale-max 1.5 \
+  --friction-scale-min 0.5 --friction-scale-max 1.5 \
+  --pearl-demo-episodes-per-task 2 --pearl-bc-pretrain-updates 5000 \
+  --demo-batch-fraction 0.25 --bc-weight 1.0 --bc-decay-steps 250000 \
   --total-steps 1000000
+```
+
+Set `--pearl-demo-episodes-per-task 0` to run the original random-exploration
+PEARL variant. TensorBoard logs `demo/pearl_*`, `pretrain/pearl_bc_loss`,
+`loss/bc`, and `schedule/pearl_bc_weight` alongside adaptation success.
+
+## Run the legacy Phase 2 goal task distribution
+
+The prior fixed-goal PEARL experiment remains available for comparison:
+
+```bash
+moebius-train --algorithm pearl --pearl-task-distribution goal \
+  --pearl-demo-episodes-per-task 0 --total-steps 250000
 ```
 
 For a quick wiring check, shrink both training and meta-batch parameters so
 each task receives data early:
 
 ```bash
-moebius-train --algorithm pearl --total-steps 5000 --start-steps 1000 \
+moebius-train --algorithm pearl --pearl-task-distribution dynamics \
+  --total-steps 5000 --start-steps 1000 \
   --num-train-tasks 4 --num-eval-tasks 2 --meta-batch-size 2 \
-  --batch-size 32 --context-size 16 --eval-interval 2500
+  --batch-size 32 --context-size 16 --pearl-demo-episodes-per-task 1 \
+  --pearl-bc-pretrain-updates 100 --eval-interval 2500
 ```
 
 View training and evaluation metrics:

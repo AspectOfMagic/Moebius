@@ -36,6 +36,19 @@ class TaskBatch:
     rl: Batch
 
 
+def concatenate_task_batch_rl(primary: TaskBatch, secondary: TaskBatch) -> TaskBatch:
+    """Mix same-task online and demonstration samples, retaining online context."""
+    if not np.array_equal(primary.task_ids, secondary.task_ids):
+        raise ValueError("Task batches must use identical task ids in the same order.")
+    return TaskBatch(
+        task_ids=primary.task_ids,
+        context=primary.context,
+        rl=Batch(
+            *(np.concatenate((getattr(primary.rl, field), getattr(secondary.rl, field)), axis=1) for field in Batch.__dataclass_fields__)
+        ),
+    )
+
+
 class ReplayBuffer:
     def __init__(self, observation_dim: int, action_dim: int, capacity: int, seed: int = 1) -> None:
         self.observations = np.empty((capacity, observation_dim), dtype=np.float32)
@@ -120,10 +133,24 @@ class MultiTaskReplayBuffer:
                 f"Need {meta_batch_size} tasks with at least {minimum_size} transitions; found {len(eligible)}."
             )
         task_ids = self.rng.choice(np.asarray(eligible), size=meta_batch_size, replace=False)
+        return self.sample_meta_batch_for_task_ids(task_ids, batch_size, context_size)
+
+    def sample_meta_batch_for_task_ids(
+        self, task_ids: np.ndarray, batch_size: int, context_size: int
+    ) -> TaskBatch:
+        if batch_size < 1 or context_size < 1:
+            raise ValueError("batch_size and context_size must both be positive.")
+        task_ids = np.asarray(task_ids, dtype=np.int64)
+        if task_ids.ndim != 1 or len(task_ids) == 0 or len(np.unique(task_ids)) != len(task_ids):
+            raise ValueError("task_ids must be a non-empty one-dimensional array of unique ids.")
+        minimum_size = max(batch_size, context_size)
+        undersized = [int(task_id) for task_id in task_ids if self._buffer(int(task_id)).size < minimum_size]
+        if undersized:
+            raise ValueError(f"Tasks {undersized} need at least {minimum_size} transitions.")
         contexts = [self._buffer(int(task_id)).sample(context_size) for task_id in task_ids]
         rl_batches = [self._buffer(int(task_id)).sample(batch_size) for task_id in task_ids]
         return TaskBatch(
-            task_ids=task_ids.astype(np.int64, copy=False),
+            task_ids=task_ids,
             context=self._stack(contexts),
             rl=self._stack(rl_batches),
         )

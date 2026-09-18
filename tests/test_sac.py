@@ -2,11 +2,16 @@ import numpy as np
 import torch
 
 from moebius.config import TrainConfig
-from moebius.envs import GoalTaskSampler
+from moebius.envs import DynamicsTaskSampler, GoalTaskSampler
 from moebius.networks import ContextEncoder
 from moebius.pearl import PEARLAgent, context_from_batch
 from moebius.networks import SquashedGaussianActor
-from moebius.replay_buffer import MultiTaskReplayBuffer, ReplayBuffer, concatenate_batches
+from moebius.replay_buffer import (
+    MultiTaskReplayBuffer,
+    ReplayBuffer,
+    concatenate_batches,
+    concatenate_task_batch_rl,
+)
 from moebius.sac import SACAgent
 from moebius.train import demonstration_batch_sizes, online_bc_weight
 
@@ -29,6 +34,16 @@ def test_phase_three_defaults_to_pick_and_place_with_disjoint_task_configs() -> 
     assert {task.reset_seed for task in sampler.train_tasks}.isdisjoint(
         task.reset_seed for task in sampler.test_tasks
     )
+
+
+def test_dynamics_tasks_hide_disjoint_mass_and_friction_pairs() -> None:
+    sampler = DynamicsTaskSampler(3, 2, mass_scale_min=0.5, mass_scale_max=1.5, friction_scale_min=0.5, friction_scale_max=1.5, seed=9)
+    train_parameters = {(task.mass_scale, task.friction_scale) for task in sampler.train_tasks}
+    test_parameters = {(task.mass_scale, task.friction_scale) for task in sampler.test_tasks}
+
+    assert train_parameters.isdisjoint(test_parameters)
+    assert all(task.reset_seed is None for task in sampler.train_tasks + sampler.test_tasks)
+    assert all(0.5 <= mass <= 1.5 and 0.5 <= friction <= 1.5 for mass, friction in train_parameters | test_parameters)
 
 
 def test_sac_update_produces_finite_metrics() -> None:
@@ -95,3 +110,26 @@ def test_multitask_buffer_and_pearl_update_produce_finite_metrics() -> None:
     assert all(np.isfinite(value) for value in metrics.values())
     action = agent.act(np.zeros(observation_dim, dtype=np.float32), deterministic=True)
     assert action.shape == (action_dim,)
+
+
+def test_demonstration_augmented_pearl_updates() -> None:
+    observation_dim, action_dim = 3, 2
+    online = MultiTaskReplayBuffer(range(3), observation_dim, action_dim, capacity=32)
+    demonstrations = MultiTaskReplayBuffer(range(3), observation_dim, action_dim, capacity=32)
+    for task_id in range(3):
+        for _ in range(32):
+            transition = (np.random.randn(observation_dim), np.random.uniform(-1, 1, action_dim), float(np.random.randn()), np.random.randn(observation_dim), False)
+            online.add(task_id, *transition)
+            demonstrations.add(task_id, *transition)
+    online_batch = online.sample_meta_batch(meta_batch_size=2, batch_size=8, context_size=6)
+    demo_batch = demonstrations.sample_meta_batch_for_task_ids(online_batch.task_ids, batch_size=4, context_size=6)
+    mixed_batch = concatenate_task_batch_rl(online_batch, demo_batch)
+    agent = PEARLAgent(observation_dim, np.full(action_dim, -1.0), np.full(action_dim, 1.0), latent_dim=4, hidden_dim=16)
+
+    pretrain_metrics = agent.behavior_clone(demo_batch)
+    metrics = agent.update(mixed_batch, demo_batch, bc_weight=0.5)
+
+    assert mixed_batch.rl.observations.shape == (2, 12, observation_dim)
+    assert all(np.isfinite(value) for value in pretrain_metrics.values())
+    assert all(np.isfinite(value) for value in metrics.values())
+    assert metrics["loss/bc"] >= 0
