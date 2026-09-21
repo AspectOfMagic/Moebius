@@ -50,8 +50,10 @@ Phase 4 introduces hidden object dynamics.
   than using a visible configuration as a task label.
 - Before online training, MetaWorld's scripted pick-and-place expert collects
   demonstrations for every training dynamics task. PEARL behavior-clones both
-  its actor and context encoder, then uses persistent per-task demonstrations
-  in mixed online/offline updates with a decaying cloning loss.
+  its actor and context encoder using chronological context windows of lengths
+  1, 4, 8, 16, or 32, plus explicit empty-context (`z = 0`) training. It then
+  uses persistent per-task demonstrations in mixed online/offline updates with
+  a cloning-loss floor instead of removing the expert anchor entirely.
 
 ## Setup
 
@@ -112,12 +114,18 @@ moebius-train --algorithm pearl --pearl-task-distribution dynamics \
   --friction-scale-min 0.5 --friction-scale-max 1.5 \
   --pearl-demo-episodes-per-task 2 --pearl-bc-pretrain-updates 5000 \
   --demo-batch-fraction 0.25 --bc-weight 1.0 --bc-decay-steps 250000 \
+  --pearl-bc-weight-floor 0.1 --context-episodes-per-task 64 \
   --total-steps 1000000
 ```
 
 Set `--pearl-demo-episodes-per-task 0` to run the original random-exploration
 PEARL variant. TensorBoard logs `demo/pearl_*`, `pretrain/pearl_bc_loss`,
 `loss/bc`, and `schedule/pearl_bc_weight` alongside adaptation success.
+
+The context buffers preserve episode order. During online fine-tuning, expert
+actions are cloned under the learner's own current task context, not a
+separate clean expert context. This aligns the latent used during training
+with the empty/partial context available at deployment.
 
 ## Run the legacy Phase 2 goal task distribution
 

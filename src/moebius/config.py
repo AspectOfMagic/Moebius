@@ -42,6 +42,8 @@ class TrainConfig:
     friction_scale_max: float = 1.5
     pearl_demo_episodes_per_task: int = 2
     pearl_bc_pretrain_updates: int = 5_000
+    pearl_bc_weight_floor: float = 0.1
+    context_episodes_per_task: int = 64
     latent_dim: int = 5
     encoder_lr: float = 3e-4
     kl_weight: float = 0.1

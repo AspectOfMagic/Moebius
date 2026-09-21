@@ -117,14 +117,22 @@ class PEARLAgent:
         action, _ = self.actor(observation_tensor, latent_tensor, deterministic=deterministic)
         return action.squeeze(0).cpu().numpy()
 
-    def behavior_clone(self, task_batch: TaskBatch) -> dict[str, float]:
-        """Behavior-clone the actor and task encoder from expert task batches."""
-        context = self._tensor(context_from_batch(task_batch.context))
+    def behavior_clone(self, task_batch: TaskBatch, prior_context: bool = False) -> dict[str, float]:
+        """Clone expert actions under either a context prefix or the prior.
+
+        ``prior_context`` explicitly trains the empty-context policy used for
+        the first action after a reset. Otherwise, the latent comes from the
+        chronological task context supplied by the caller.
+        """
         observations = self._flatten(task_batch.rl.observations)
         actions = self._flatten(task_batch.rl.actions)
         _, transitions = task_batch.rl.observations.shape[:2]
-        posterior_mean, _ = self.encoder(context)
-        latents = self._expand_latents(posterior_mean, transitions)
+        if prior_context:
+            latents = torch.zeros((len(task_batch.task_ids) * transitions, self.latent_dim), device=self.device)
+        else:
+            context = self._tensor(context_from_batch(task_batch.context))
+            posterior_mean, _ = self.encoder(context)
+            latents = self._expand_latents(posterior_mean, transitions)
         predicted_actions, _ = self.actor(observations, latents, deterministic=True)
         loss = F.mse_loss(predicted_actions, actions)
         self.actor_optimizer.zero_grad()
@@ -182,13 +190,14 @@ class PEARLAgent:
         sac_actor_loss = (self.alpha.detach() * log_prob - q_value).mean()
         bc_loss = torch.zeros((), device=self.device)
         if demonstration_batch is not None and bc_weight > 0:
-            demo_context = self._tensor(context_from_batch(demonstration_batch.context))
             demo_observations = self._flatten(demonstration_batch.rl.observations)
             demo_actions = self._flatten(demonstration_batch.rl.actions)
             _, demo_transitions = demonstration_batch.rl.observations.shape[:2]
+            # Deployment conditions the actor on the learner's current
+            # context. Clone expert actions under that same latent instead of
+            # a separate, clean expert-only context.
             with torch.no_grad():
-                demo_mean, _ = self.encoder(demo_context)
-                demo_latents = self._expand_latents(demo_mean, demo_transitions)
+                demo_latents = self._expand_latents(actor_mean, demo_transitions)
             predicted_demo_actions, _ = self.actor(demo_observations, demo_latents, deterministic=True)
             bc_loss = F.mse_loss(predicted_demo_actions, demo_actions)
         actor_loss = sac_actor_loss + bc_weight * bc_loss

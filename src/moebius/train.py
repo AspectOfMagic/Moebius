@@ -15,6 +15,8 @@ from moebius.pearl import PEARLAgent, context_transition
 from moebius.replay_buffer import (
     MultiTaskReplayBuffer,
     ReplayBuffer,
+    TaskBatch,
+    TaskTrajectoryContextBuffer,
     concatenate_batches,
     concatenate_task_batch_rl,
 )
@@ -88,6 +90,18 @@ def parse_args() -> TrainConfig:
         type=int,
         default=5_000,
         help="PEARL actor/encoder behavior-cloning updates before online training.",
+    )
+    parser.add_argument(
+        "--pearl-bc-weight-floor",
+        type=float,
+        default=0.1,
+        help="Minimum online PEARL behavior-cloning weight after decay.",
+    )
+    parser.add_argument(
+        "--context-episodes-per-task",
+        type=int,
+        default=64,
+        help="Completed chronological context episodes retained per PEARL task.",
     )
     parser.add_argument("--latent-dim", type=int, default=5)
     parser.add_argument("--encoder-lr", type=float, default=3e-4)
@@ -332,7 +346,7 @@ def collect_pearl_demonstrations(
     observation_dim: int,
     action_dim: int,
     writer: SummaryWriter,
-) -> MultiTaskReplayBuffer | None:
+) -> tuple[MultiTaskReplayBuffer, TaskTrajectoryContextBuffer] | None:
     """Collect persistent expert trajectories for every PEARL train task."""
     episodes_per_task = config.pearl_demo_episodes_per_task
     if episodes_per_task == 0:
@@ -349,6 +363,9 @@ def collect_pearl_demonstrations(
         episodes_per_task * config.max_episode_steps,
         config.seed + 20_000,
     )
+    contexts = TaskTrajectoryContextBuffer(
+        (task.task_id for task in tasks), config.context_episodes_per_task, config.seed + 30_000
+    )
     environment = MetaWorldSingleTaskEnv(config.env_name, config.seed + 3, config.max_episode_steps)
     expert = _pick_place_expert()
     total_successes = 0
@@ -357,6 +374,7 @@ def collect_pearl_demonstrations(
             task_successes = 0
             for episode in range(episodes_per_task):
                 observation = _reset_task(environment, task)
+                contexts.begin_episode(task.task_id)
                 terminated = truncated = False
                 episode_return = 0.0
                 info: dict[str, float] = {}
@@ -365,8 +383,10 @@ def collect_pearl_demonstrations(
                     action = np.clip(action, environment.action_space.low, environment.action_space.high)
                     next_observation, reward, terminated, truncated, info = environment.step(action)
                     buffer.add(task.task_id, observation, action, reward, next_observation, terminated)
+                    contexts.add(task.task_id, observation, action, reward, next_observation, terminated)
                     observation = next_observation
                     episode_return += reward
+                contexts.end_episode(task.task_id)
                 success = float(info.get("success", False))
                 task_successes += int(success)
                 writer.add_scalar(f"demo/task_{task.task_id}_return", episode_return, episode + 1)
@@ -381,7 +401,27 @@ def collect_pearl_demonstrations(
 
     writer.add_scalar("demo/pearl_success_rate", total_successes / (len(tasks) * episodes_per_task), 0)
     writer.add_scalar("demo/pearl_transitions", sum(buffer.size(task.task_id) for task in tasks), 0)
-    return buffer
+    return buffer, contexts
+
+
+def contextualize_task_batch(
+    task_batch: TaskBatch, contexts: TaskTrajectoryContextBuffer, context_size: int
+) -> TaskBatch:
+    """Replace replay's unordered context with a rollout-like prefix context."""
+    return TaskBatch(
+        task_ids=task_batch.task_ids,
+        context=contexts.sample_prefixes(task_batch.task_ids, context_size),
+        rl=task_batch.rl,
+    )
+
+
+def pearl_online_bc_weight(config: TrainConfig, step: int) -> float:
+    if not 0 <= config.pearl_bc_weight_floor <= config.bc_weight:
+        raise ValueError("--pearl-bc-weight-floor must be between zero and --bc-weight.")
+    if config.bc_decay_steps < 1:
+        raise ValueError("--bc-decay-steps must be positive.")
+    decayed = config.bc_weight * max(0.0, 1.0 - step / config.bc_decay_steps)
+    return max(config.pearl_bc_weight_floor, decayed)
 
 
 def _append_context(context: list[np.ndarray], transition: np.ndarray, context_size: int) -> np.ndarray:
@@ -470,26 +510,35 @@ def train_pearl(config: TrainConfig) -> None:
     buffer = MultiTaskReplayBuffer(
         (task.task_id for task in task_sampler.train_tasks), observation_dim, action_dim, config.replay_size, config.seed
     )
+    online_contexts = TaskTrajectoryContextBuffer(
+        (task.task_id for task in task_sampler.train_tasks), config.context_episodes_per_task, config.seed + 40_000
+    )
     run_name = f"{config.env_name}_pearl_seed{config.seed}"
     writer = SummaryWriter(config.log_dir / run_name)
     writer.add_text("config", str(asdict(config)))
 
-    demonstrations = collect_pearl_demonstrations(
+    demonstration_data = collect_pearl_demonstrations(
         config, task_sampler.train_tasks, observation_dim, action_dim, writer
     )
-    if demonstrations is not None:
+    demonstrations: MultiTaskReplayBuffer | None = None
+    if demonstration_data is not None:
+        demonstrations, demonstration_contexts = demonstration_data
         if config.pearl_bc_pretrain_updates < 0:
             raise ValueError("--pearl-bc-pretrain-updates must be non-negative.")
         for update in range(1, config.pearl_bc_pretrain_updates + 1):
-            metrics = agent.behavior_clone(
-                demonstrations.sample_meta_batch(config.meta_batch_size, config.batch_size, config.context_size)
+            demonstration_batch = contextualize_task_batch(
+                demonstrations.sample_meta_batch(config.meta_batch_size, config.batch_size, config.context_size),
+                demonstration_contexts,
+                config.context_size,
             )
+            metrics = agent.behavior_clone(demonstration_batch, prior_context=update % 4 == 0)
             if update % 100 == 0 or update == config.pearl_bc_pretrain_updates:
                 writer.add_scalar("pretrain/pearl_bc_loss", metrics["loss/bc"], update)
         online_batch_size, demo_batch_size = demonstration_batch_sizes(config.batch_size, config.demo_batch_fraction)
 
     task = task_sampler.sample_train_task()
     observation = _reset_task(environment, task)
+    online_contexts.begin_episode(task.task_id)
     episode_context: list[np.ndarray] = []
     episode_return, episode_length = 0.0, 0
     try:
@@ -502,6 +551,7 @@ def train_pearl(config: TrainConfig) -> None:
             next_observation, reward, terminated, truncated, info = environment.step(action)
             done = terminated or truncated
             buffer.add(task.task_id, observation, action, reward, next_observation, terminated)
+            online_contexts.add(task.task_id, observation, action, reward, next_observation, terminated)
             _append_context(
                 episode_context, context_transition(observation, action, reward, next_observation), config.context_size
             )
@@ -510,11 +560,13 @@ def train_pearl(config: TrainConfig) -> None:
             episode_length += 1
 
             if done:
+                online_contexts.end_episode(task.task_id)
                 writer.add_scalar("train/episode_return", episode_return, step)
                 writer.add_scalar("train/episode_length", episode_length, step)
                 writer.add_scalar("train/success", float(info.get("success", False)), step)
                 task = task_sampler.sample_train_task()
                 observation = _reset_task(environment, task)
+                online_contexts.begin_episode(task.task_id)
                 episode_context = []
                 episode_return, episode_length = 0.0, 0
 
@@ -522,12 +574,17 @@ def train_pearl(config: TrainConfig) -> None:
                 try:
                     for _ in range(config.update_every * config.updates_per_step):
                         if demonstrations is None:
-                            metrics = agent.update(
-                                buffer.sample_meta_batch(config.meta_batch_size, config.batch_size, config.context_size)
+                            online_batch = contextualize_task_batch(
+                                buffer.sample_meta_batch(config.meta_batch_size, config.batch_size, config.context_size),
+                                online_contexts,
+                                config.context_size,
                             )
+                            metrics = agent.update(online_batch)
                         else:
-                            online_batch = buffer.sample_meta_batch(
-                                config.meta_batch_size, online_batch_size, config.context_size
+                            online_batch = contextualize_task_batch(
+                                buffer.sample_meta_batch(config.meta_batch_size, online_batch_size, config.context_size),
+                                online_contexts,
+                                config.context_size,
                             )
                             demo_batch = demonstrations.sample_meta_batch_for_task_ids(
                                 online_batch.task_ids, demo_batch_size, config.context_size
@@ -535,7 +592,7 @@ def train_pearl(config: TrainConfig) -> None:
                             metrics = agent.update(
                                 concatenate_task_batch_rl(online_batch, demo_batch),
                                 demo_batch,
-                                online_bc_weight(config, step),
+                                pearl_online_bc_weight(config, step),
                             )
                 except ValueError:
                     # Not enough task-specific data yet; keep collecting.
@@ -544,7 +601,7 @@ def train_pearl(config: TrainConfig) -> None:
                     for name, value in metrics.items():
                         writer.add_scalar(name, value, step)
                     if demonstrations is not None:
-                        writer.add_scalar("schedule/pearl_bc_weight", online_bc_weight(config, step), step)
+                        writer.add_scalar("schedule/pearl_bc_weight", pearl_online_bc_weight(config, step), step)
 
             if step % config.eval_interval == 0:
                 evaluation_returns, evaluation_successes = evaluate_pearl(

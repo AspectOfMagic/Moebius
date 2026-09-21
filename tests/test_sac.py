@@ -9,11 +9,12 @@ from moebius.networks import SquashedGaussianActor
 from moebius.replay_buffer import (
     MultiTaskReplayBuffer,
     ReplayBuffer,
+    TaskTrajectoryContextBuffer,
     concatenate_batches,
     concatenate_task_batch_rl,
 )
 from moebius.sac import SACAgent
-from moebius.train import demonstration_batch_sizes, online_bc_weight
+from moebius.train import demonstration_batch_sizes, online_bc_weight, pearl_online_bc_weight
 
 
 def test_actor_respects_action_bounds() -> None:
@@ -44,6 +45,22 @@ def test_dynamics_tasks_hide_disjoint_mass_and_friction_pairs() -> None:
     assert train_parameters.isdisjoint(test_parameters)
     assert all(task.reset_seed is None for task in sampler.train_tasks + sampler.test_tasks)
     assert all(0.5 <= mass <= 1.5 and 0.5 <= friction <= 1.5 for mass, friction in train_parameters | test_parameters)
+
+
+def test_task_context_buffer_preserves_chronological_prefixes() -> None:
+    contexts = TaskTrajectoryContextBuffer((0, 1), max_episodes_per_task=2, seed=3)
+    for task_id in (0, 1):
+        contexts.begin_episode(task_id)
+        for step in range(10):
+            observation = np.array([float(step), float(task_id)], dtype=np.float32)
+            contexts.add(task_id, observation, np.array([step], dtype=np.float32), float(step), observation + 1, False)
+        contexts.end_episode(task_id)
+
+    batch = contexts.sample_prefixes(np.array([0, 1]), max_context_size=8)
+
+    assert batch.observations.shape[0] == 2
+    assert batch.observations.shape[1] in (1, 4, 8)
+    assert np.all(np.diff(batch.observations[:, :, 0], axis=1) == 1)
 
 
 def test_sac_update_produces_finite_metrics() -> None:
@@ -127,9 +144,12 @@ def test_demonstration_augmented_pearl_updates() -> None:
     agent = PEARLAgent(observation_dim, np.full(action_dim, -1.0), np.full(action_dim, 1.0), latent_dim=4, hidden_dim=16)
 
     pretrain_metrics = agent.behavior_clone(demo_batch)
+    prior_pretrain_metrics = agent.behavior_clone(demo_batch, prior_context=True)
     metrics = agent.update(mixed_batch, demo_batch, bc_weight=0.5)
 
     assert mixed_batch.rl.observations.shape == (2, 12, observation_dim)
     assert all(np.isfinite(value) for value in pretrain_metrics.values())
+    assert all(np.isfinite(value) for value in prior_pretrain_metrics.values())
     assert all(np.isfinite(value) for value in metrics.values())
     assert metrics["loss/bc"] >= 0
+    assert pearl_online_bc_weight(TrainConfig(bc_weight=1.0, bc_decay_steps=100, pearl_bc_weight_floor=0.1), 100) == 0.1
