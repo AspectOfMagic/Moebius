@@ -40,13 +40,25 @@ class SquashedGaussianActor(nn.Module):
         self.register_buffer("action_scale", (action_high - action_low) / 2)
         self.register_buffer("action_bias", (action_high + action_low) / 2)
 
-    def forward(
-        self, observation: Tensor, latent: Tensor | None = None, deterministic: bool = False
-    ) -> tuple[Tensor, Tensor]:
+    def distribution_parameters(self, observation: Tensor, latent: Tensor | None = None) -> tuple[Tensor, Tensor]:
+        """Return the pre-tanh Gaussian parameters used by the policy."""
         inputs = observation if latent is None else torch.cat((observation, latent), dim=-1)
         features = self.backbone(inputs)
         mean = self.mean(features)
         log_std = self.log_std(features).clamp(-20, 2)
+        return mean, log_std
+
+    def deterministic_action_and_log_std(
+        self, observation: Tensor, latent: Tensor | None = None
+    ) -> tuple[Tensor, Tensor]:
+        """Expose policy spread so behavior cloning can constrain exploration."""
+        mean, log_std = self.distribution_parameters(observation, latent)
+        return torch.tanh(mean) * self.action_scale + self.action_bias, log_std
+
+    def forward(
+        self, observation: Tensor, latent: Tensor | None = None, deterministic: bool = False
+    ) -> tuple[Tensor, Tensor]:
+        mean, log_std = self.distribution_parameters(observation, latent)
         distribution = Normal(mean, log_std.exp())
         pre_tanh = mean if deterministic else distribution.rsample()
         squashed_action = torch.tanh(pre_tanh)
@@ -79,9 +91,12 @@ class ContextEncoder(nn.Module):
     context.
     """
 
-    def __init__(self, context_dim: int, latent_dim: int, hidden_dim: int) -> None:
+    def __init__(self, context_dim: int, latent_dim: int, hidden_dim: int, min_posterior_std: float = 0.05) -> None:
         super().__init__()
+        if not 0 < min_posterior_std <= 1:
+            raise ValueError("min_posterior_std must be in (0, 1].")
         self.latent_dim = latent_dim
+        self.min_posterior_variance = min_posterior_std**2
         self.network = mlp(context_dim, 2 * latent_dim, hidden_dim)
 
     def forward(self, context: Tensor) -> tuple[Tensor, Tensor]:
@@ -97,4 +112,5 @@ class ContextEncoder(nn.Module):
         posterior_precision = 1 + precisions.sum(dim=1)
         posterior_variance = posterior_precision.reciprocal()
         posterior_mean = posterior_variance * (precisions * means).sum(dim=1)
+        posterior_variance = posterior_variance.clamp_min(self.min_posterior_variance)
         return posterior_mean, posterior_variance.log()

@@ -35,6 +35,9 @@ def parse_args() -> TrainConfig:
     parser.add_argument("--total-steps", type=int, default=250_000)
     parser.add_argument("--start-steps", type=int, default=10_000)
     parser.add_argument("--batch-size", type=int, default=256)
+    parser.add_argument("--actor-lr", type=float, default=3e-4)
+    parser.add_argument("--critic-lr", type=float, default=3e-4)
+    parser.add_argument("--alpha-lr", type=float, default=3e-4)
     parser.add_argument("--eval-interval", type=int, default=10_000)
     parser.add_argument("--log-dir", type=Path, default=Path("runs"))
     parser.add_argument("--checkpoint-dir", type=Path, default=Path("checkpoints"))
@@ -86,10 +89,22 @@ def parse_args() -> TrainConfig:
         help="Expert rollout count per hidden-dynamics PEARL training task; set to 0 to disable demo warm-starting.",
     )
     parser.add_argument(
+        "--pearl-demo-max-attempts-per-task",
+        type=int,
+        default=20,
+        help="Maximum scripted-expert attempts used to collect the requested successful PEARL demonstrations per task.",
+    )
+    parser.add_argument(
         "--pearl-bc-pretrain-updates",
         type=int,
         default=5_000,
         help="PEARL actor/encoder behavior-cloning updates before online training.",
+    )
+    parser.add_argument(
+        "--pearl-critic-pretrain-updates",
+        type=int,
+        default=5_000,
+        help="Joint PEARL critic/actor/encoder updates on demonstrations before online interaction.",
     )
     parser.add_argument(
         "--pearl-bc-weight-floor",
@@ -97,6 +112,20 @@ def parse_args() -> TrainConfig:
         default=0.1,
         help="Minimum online PEARL behavior-cloning weight after decay.",
     )
+    parser.add_argument(
+        "--pearl-reward-scale",
+        type=float,
+        default=0.1,
+        help="Reward scale used by PEARL critics and context features.",
+    )
+    parser.add_argument(
+        "--pearl-fixed-alpha",
+        type=float,
+        default=0.1,
+        help="Fixed PEARL entropy coefficient; prevents automatic-temperature runaway.",
+    )
+    parser.add_argument("--gradient-clip-norm", type=float, default=10.0)
+    parser.add_argument("--min-posterior-std", type=float, default=0.05)
     parser.add_argument(
         "--context-episodes-per-task",
         type=int,
@@ -353,6 +382,11 @@ def collect_pearl_demonstrations(
         return None
     if episodes_per_task < 0:
         raise ValueError("--pearl-demo-episodes-per-task must be non-negative.")
+    if config.pearl_demo_max_attempts_per_task < episodes_per_task:
+        raise ValueError(
+            "--pearl-demo-max-attempts-per-task must be at least "
+            "--pearl-demo-episodes-per-task."
+        )
     if config.env_name != "pick-place-v3":
         raise ValueError("PEARL demonstrations currently support only --env-name pick-place-v3.")
 
@@ -369,37 +403,56 @@ def collect_pearl_demonstrations(
     environment = MetaWorldSingleTaskEnv(config.env_name, config.seed + 3, config.max_episode_steps)
     expert = _pick_place_expert()
     total_successes = 0
+    total_attempts = 0
     try:
         for task in tasks:
             task_successes = 0
-            for episode in range(episodes_per_task):
+            task_attempts = 0
+            while (
+                task_successes < episodes_per_task
+                and task_attempts < config.pearl_demo_max_attempts_per_task
+            ):
+                task_attempts += 1
                 observation = _reset_task(environment, task)
-                contexts.begin_episode(task.task_id)
                 terminated = truncated = False
                 episode_return = 0.0
                 info: dict[str, float] = {}
+                trajectory: list[tuple[np.ndarray, np.ndarray, float, np.ndarray, bool]] = []
                 while not (terminated or truncated):
                     action = np.asarray(expert.get_action(observation), dtype=np.float32)
                     action = np.clip(action, environment.action_space.low, environment.action_space.high)
                     next_observation, reward, terminated, truncated, info = environment.step(action)
-                    buffer.add(task.task_id, observation, action, reward, next_observation, terminated)
-                    contexts.add(task.task_id, observation, action, reward, next_observation, terminated)
+                    trajectory.append((observation, action, reward, next_observation, terminated))
                     observation = next_observation
                     episode_return += reward
-                contexts.end_episode(task.task_id)
                 success = float(info.get("success", False))
                 task_successes += int(success)
-                writer.add_scalar(f"demo/task_{task.task_id}_return", episode_return, episode + 1)
-                writer.add_scalar(f"demo/task_{task.task_id}_success", success, episode + 1)
+                writer.add_scalar(f"demo/task_{task.task_id}_return", episode_return, task_attempts)
+                writer.add_scalar(f"demo/task_{task.task_id}_success", success, task_attempts)
+                if success:
+                    # A failed scripted rollout is not an expert demonstration.
+                    # Keep the replay and the chronological context buffer aligned
+                    # by committing the entire trajectory only after success.
+                    contexts.begin_episode(task.task_id)
+                    for transition in trajectory:
+                        buffer.add(task.task_id, *transition)
+                        contexts.add(task.task_id, *transition)
+                    contexts.end_episode(task.task_id)
+            total_attempts += task_attempts
             total_successes += task_successes
             if task_successes != episodes_per_task:
                 raise RuntimeError(
-                    f"Only {task_successes}/{episodes_per_task} expert rollouts succeeded for PEARL task {task.task_id}."
+                    f"Collected only {task_successes}/{episodes_per_task} successful expert rollouts for PEARL "
+                    f"task {task.task_id} after {task_attempts}/{config.pearl_demo_max_attempts_per_task} attempts."
                 )
+            writer.add_scalar(f"demo/task_{task.task_id}_attempts", task_attempts, 0)
+            writer.add_scalar(f"demo/task_{task.task_id}_attempt_success_rate", task_successes / task_attempts, 0)
     finally:
         environment.close()
 
     writer.add_scalar("demo/pearl_success_rate", total_successes / (len(tasks) * episodes_per_task), 0)
+    writer.add_scalar("demo/pearl_attempt_success_rate", total_successes / total_attempts, 0)
+    writer.add_scalar("demo/pearl_attempts", total_attempts, 0)
     writer.add_scalar("demo/pearl_transitions", sum(buffer.size(task.task_id) for task in tasks), 0)
     return buffer, contexts
 
@@ -441,17 +494,22 @@ def _pearl_episode(
     buffer: MultiTaskReplayBuffer | None = None,
 ) -> tuple[float, float]:
     observation = _reset_task(environment, task)
+    initial_context = np.asarray(context, dtype=np.float32) if context else None
+    episode_latent = agent.infer_latent(initial_context, deterministic=deterministic)
     terminated = truncated = False
     episode_return = 0.0
     info: dict[str, float] = {}
     while not (terminated or truncated):
-        current_context = np.asarray(context, dtype=np.float32) if context else None
-        action = agent.act(observation, current_context, deterministic=deterministic)
+        action = agent.act(observation, deterministic=deterministic, latent=episode_latent)
         next_observation, reward, terminated, truncated, info = environment.step(action)
         if buffer is not None:
             # As in SAC, time-limit truncation should still bootstrap.
             buffer.add(task.task_id, observation, action, reward, next_observation, terminated)
-        _append_context(context, context_transition(observation, action, reward, next_observation), context_size)
+        _append_context(
+            context,
+            context_transition(observation, action, reward, next_observation, agent.reward_scale),
+            context_size,
+        )
         observation = next_observation
         episode_return += reward
     return episode_return, float(info.get("success", False))
@@ -505,6 +563,10 @@ def train_pearl(config: TrainConfig) -> None:
         alpha_lr=config.alpha_lr,
         kl_weight=config.kl_weight,
         target_entropy=config.target_entropy,
+        reward_scale=config.pearl_reward_scale,
+        fixed_alpha=config.pearl_fixed_alpha,
+        gradient_clip_norm=config.gradient_clip_norm,
+        min_posterior_std=config.min_posterior_std,
         device=device,
     )
     buffer = MultiTaskReplayBuffer(
@@ -534,26 +596,44 @@ def train_pearl(config: TrainConfig) -> None:
             metrics = agent.behavior_clone(demonstration_batch, prior_context=update % 4 == 0)
             if update % 100 == 0 or update == config.pearl_bc_pretrain_updates:
                 writer.add_scalar("pretrain/pearl_bc_loss", metrics["loss/bc"], update)
+        if config.pearl_critic_pretrain_updates < 0:
+            raise ValueError("--pearl-critic-pretrain-updates must be non-negative.")
+        for update in range(1, config.pearl_critic_pretrain_updates + 1):
+            demonstration_batch = contextualize_task_batch(
+                demonstrations.sample_meta_batch(config.meta_batch_size, config.batch_size, config.context_size),
+                demonstration_contexts,
+                config.context_size,
+            )
+            # Keep the cloned actor synchronized with the encoder while the
+            # value functions warm up on demonstration-only data.
+            metrics = agent.update(demonstration_batch, demonstration_batch, bc_weight=config.bc_weight)
+            if update % 100 == 0 or update == config.pearl_critic_pretrain_updates:
+                writer.add_scalar("pretrain/pearl_critic_loss", metrics["loss/critic"], update)
+                writer.add_scalar("pretrain/pearl_kl_loss", metrics["loss/kl"], update)
+                writer.add_scalar("pretrain/pearl_joint_bc_loss", metrics["loss/bc"], update)
         online_batch_size, demo_batch_size = demonstration_batch_sizes(config.batch_size, config.demo_batch_fraction)
 
     task = task_sampler.sample_train_task()
     observation = _reset_task(environment, task)
     online_contexts.begin_episode(task.task_id)
-    episode_context: list[np.ndarray] = []
+    task_context: list[np.ndarray] = []
+    episode_latent = agent.infer_latent(None)
+    episodes_on_task = 0
     episode_return, episode_length = 0.0, 0
     try:
         for step in range(1, config.total_steps + 1):
             if demonstrations is None and step <= config.start_steps:
                 action = environment.action_space.sample()
             else:
-                current_context = np.asarray(episode_context, dtype=np.float32) if episode_context else None
-                action = agent.act(observation, current_context)
+                action = agent.act(observation, latent=episode_latent)
             next_observation, reward, terminated, truncated, info = environment.step(action)
             done = terminated or truncated
             buffer.add(task.task_id, observation, action, reward, next_observation, terminated)
             online_contexts.add(task.task_id, observation, action, reward, next_observation, terminated)
             _append_context(
-                episode_context, context_transition(observation, action, reward, next_observation), config.context_size
+                task_context,
+                context_transition(observation, action, reward, next_observation, agent.reward_scale),
+                config.context_size,
             )
             observation = next_observation
             episode_return += reward
@@ -564,10 +644,15 @@ def train_pearl(config: TrainConfig) -> None:
                 writer.add_scalar("train/episode_return", episode_return, step)
                 writer.add_scalar("train/episode_length", episode_length, step)
                 writer.add_scalar("train/success", float(info.get("success", False)), step)
-                task = task_sampler.sample_train_task()
+                episodes_on_task += 1
+                if episodes_on_task >= config.adaptation_episodes + 1:
+                    task = task_sampler.sample_train_task()
+                    task_context = []
+                    episodes_on_task = 0
                 observation = _reset_task(environment, task)
                 online_contexts.begin_episode(task.task_id)
-                episode_context = []
+                current_context = np.asarray(task_context, dtype=np.float32) if task_context else None
+                episode_latent = agent.infer_latent(current_context)
                 episode_return, episode_length = 0.0, 0
 
             if step >= config.update_after and step % config.update_every == 0:

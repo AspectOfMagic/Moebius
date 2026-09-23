@@ -41,8 +41,14 @@ class TrainConfig:
     friction_scale_min: float = 0.5
     friction_scale_max: float = 1.5
     pearl_demo_episodes_per_task: int = 2
+    pearl_demo_max_attempts_per_task: int = 20
     pearl_bc_pretrain_updates: int = 5_000
+    pearl_critic_pretrain_updates: int = 5_000
     pearl_bc_weight_floor: float = 0.1
+    pearl_reward_scale: float = 0.1
+    pearl_fixed_alpha: float = 0.1
+    gradient_clip_norm: float = 10.0
+    min_posterior_std: float = 0.05
     context_episodes_per_task: int = 64
     latent_dim: int = 5
     encoder_lr: float = 3e-4

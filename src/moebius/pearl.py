@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
+import math
 
 import numpy as np
 import torch
@@ -13,25 +14,29 @@ from moebius.networks import ContextEncoder, QNetwork, SquashedGaussianActor
 from moebius.replay_buffer import Batch, TaskBatch
 
 
-def context_from_batch(batch: Batch) -> np.ndarray:
+def context_from_batch(batch: Batch, reward_scale: float = 1.0) -> np.ndarray:
     """Build PEARL context features ``[s, a, r, s']`` from a replay batch."""
     rewards = batch.rewards
     if rewards.ndim == batch.observations.ndim - 1:
         rewards = rewards[..., None]
-    return np.concatenate((batch.observations, batch.actions, rewards, batch.next_observations), axis=-1).astype(
+    return np.concatenate((batch.observations, batch.actions, reward_scale * rewards, batch.next_observations), axis=-1).astype(
         np.float32, copy=False
     )
 
 
 def context_transition(
-    observation: np.ndarray, action: np.ndarray, reward: float, next_observation: np.ndarray
+    observation: np.ndarray,
+    action: np.ndarray,
+    reward: float,
+    next_observation: np.ndarray,
+    reward_scale: float = 1.0,
 ) -> np.ndarray:
     """Build one context feature vector while collecting an episode."""
     return np.concatenate(
         (
             np.asarray(observation, dtype=np.float32).reshape(-1),
             np.asarray(action, dtype=np.float32).reshape(-1),
-            np.asarray([reward], dtype=np.float32),
+            np.asarray([reward_scale * reward], dtype=np.float32),
             np.asarray(next_observation, dtype=np.float32).reshape(-1),
         )
     )
@@ -61,6 +66,10 @@ class PEARLAgent:
         alpha_lr: float = 3e-4,
         kl_weight: float = 0.1,
         target_entropy: float | None = None,
+        reward_scale: float = 0.1,
+        fixed_alpha: float | None = 0.1,
+        gradient_clip_norm: float = 10.0,
+        min_posterior_std: float = 0.05,
         device: str = "cpu",
     ) -> None:
         if latent_dim < 1:
@@ -72,7 +81,15 @@ class PEARLAgent:
         action_dim = int(np.prod(action_low.shape))
         action_low_tensor = torch.as_tensor(action_low, dtype=torch.float32, device=self.device)
         action_high_tensor = torch.as_tensor(action_high, dtype=torch.float32, device=self.device)
-        self.encoder = ContextEncoder(self.context_dim, latent_dim, hidden_dim).to(self.device)
+        if reward_scale <= 0:
+            raise ValueError("reward_scale must be positive.")
+        if fixed_alpha is not None and fixed_alpha <= 0:
+            raise ValueError("fixed_alpha must be positive when supplied.")
+        if gradient_clip_norm <= 0:
+            raise ValueError("gradient_clip_norm must be positive.")
+        self.encoder = ContextEncoder(
+            self.context_dim, latent_dim, hidden_dim, min_posterior_std=min_posterior_std
+        ).to(self.device)
         self.actor = SquashedGaussianActor(
             observation_dim, action_dim, hidden_dim, action_low_tensor, action_high_tensor, latent_dim
         ).to(self.device)
@@ -83,12 +100,21 @@ class PEARLAgent:
         self.actor_optimizer = torch.optim.Adam(self.actor.parameters(), lr=actor_lr)
         self.critic_optimizer = torch.optim.Adam(list(self.q1.parameters()) + list(self.q2.parameters()), lr=critic_lr)
         self.encoder_optimizer = torch.optim.Adam(self.encoder.parameters(), lr=encoder_lr)
-        self.log_alpha = torch.zeros(1, device=self.device, requires_grad=True)
-        self.alpha_optimizer = torch.optim.Adam([self.log_alpha], lr=alpha_lr)
+        initial_log_alpha = 0.0 if fixed_alpha is None else math.log(fixed_alpha)
+        self.log_alpha = torch.tensor(
+            [initial_log_alpha], device=self.device, requires_grad=fixed_alpha is None
+        )
+        self.alpha_optimizer = (
+            torch.optim.Adam([self.log_alpha], lr=alpha_lr) if fixed_alpha is None else None
+        )
         self.target_entropy = target_entropy if target_entropy is not None else -float(action_dim)
         self.gamma = gamma
         self.tau = tau
         self.kl_weight = kl_weight
+        self.reward_scale = reward_scale
+        self.gradient_clip_norm = gradient_clip_norm
+        self.bc_log_std_target = -2.0
+        self.bc_log_std_weight = 0.01
 
     @property
     def alpha(self) -> Tensor:
@@ -110,10 +136,11 @@ class PEARLAgent:
         observation: np.ndarray,
         context: np.ndarray | None = None,
         deterministic: bool = False,
+        latent: np.ndarray | None = None,
     ) -> np.ndarray:
         observation_tensor = self._tensor(observation).reshape(1, -1)
-        latent = self.infer_latent(context, deterministic=deterministic)
-        latent_tensor = self._tensor(latent).reshape(1, -1)
+        selected_latent = self.infer_latent(context, deterministic=deterministic) if latent is None else latent
+        latent_tensor = self._tensor(selected_latent).reshape(1, -1)
         action, _ = self.actor(observation_tensor, latent_tensor, deterministic=deterministic)
         return action.squeeze(0).cpu().numpy()
 
@@ -130,28 +157,35 @@ class PEARLAgent:
         if prior_context:
             latents = torch.zeros((len(task_batch.task_ids) * transitions, self.latent_dim), device=self.device)
         else:
-            context = self._tensor(context_from_batch(task_batch.context))
-            posterior_mean, _ = self.encoder(context)
-            latents = self._expand_latents(posterior_mean, transitions)
-        predicted_actions, _ = self.actor(observations, latents, deterministic=True)
-        loss = F.mse_loss(predicted_actions, actions)
+            context = self._tensor(context_from_batch(task_batch.context, self.reward_scale))
+            posterior_mean, posterior_log_variance = self.encoder(context)
+            latents = self._expand_latents(
+                self._sample_latents(posterior_mean, posterior_log_variance), transitions
+            )
+        loss, action_loss, spread_loss = self._behavior_cloning_loss(observations, actions, latents)
         self.actor_optimizer.zero_grad()
         self.encoder_optimizer.zero_grad()
         loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.actor.parameters(), self.gradient_clip_norm)
+        torch.nn.utils.clip_grad_norm_(self.encoder.parameters(), self.gradient_clip_norm)
         self.actor_optimizer.step()
         self.encoder_optimizer.step()
-        return {"loss/bc": loss.item()}
+        return {
+            "loss/bc": loss.item(),
+            "loss/bc_action": action_loss.item(),
+            "loss/bc_spread": spread_loss.item(),
+        }
 
-    def update(
-        self,
-        task_batch: TaskBatch,
-        demonstration_batch: TaskBatch | None = None,
-        bc_weight: float = 0.0,
-    ) -> dict[str, float]:
-        context = self._tensor(context_from_batch(task_batch.context))
+    def update_critic(self, task_batch: TaskBatch) -> dict[str, float]:
+        """Update critics and task inference without changing the actor.
+
+        This is also used for demonstration-only warm-up so online collection
+        does not begin with random value functions.
+        """
+        context = self._tensor(context_from_batch(task_batch.context, self.reward_scale))
         observations = self._flatten(task_batch.rl.observations)
         actions = self._flatten(task_batch.rl.actions)
-        rewards = self._flatten(task_batch.rl.rewards)
+        rewards = self.reward_scale * self._flatten(task_batch.rl.rewards)
         next_observations = self._flatten(task_batch.rl.next_observations)
         dones = self._flatten(task_batch.rl.dones)
         tasks, transitions = task_batch.rl.observations.shape[:2]
@@ -159,7 +193,6 @@ class PEARLAgent:
         posterior_mean, posterior_log_variance = self.encoder(context)
         latents = self._sample_latents(posterior_mean, posterior_log_variance)
         expanded_latents = self._expand_latents(latents, transitions)
-
         with torch.no_grad():
             next_actions, next_log_prob = self.actor(next_observations, expanded_latents)
             next_q = torch.minimum(
@@ -168,26 +201,56 @@ class PEARLAgent:
             )
             target_q = rewards + self.gamma * (1 - dones) * (next_q - self.alpha * next_log_prob)
 
-        q1_loss = F.mse_loss(self.q1(observations, actions, expanded_latents), target_q)
-        q2_loss = F.mse_loss(self.q2(observations, actions, expanded_latents), target_q)
-        kl_loss = self._kl_to_standard_normal(posterior_mean, posterior_log_variance)
+        q1 = self.q1(observations, actions, expanded_latents)
+        q2 = self.q2(observations, actions, expanded_latents)
+        q1_loss = F.smooth_l1_loss(q1, target_q)
+        q2_loss = F.smooth_l1_loss(q2, target_q)
         critic_loss = q1_loss + q2_loss
+        kl_loss = self._kl_to_standard_normal(posterior_mean, posterior_log_variance)
         inference_loss = critic_loss + self.kl_weight * kl_loss
         self.critic_optimizer.zero_grad()
         self.encoder_optimizer.zero_grad()
         inference_loss.backward()
+        critic_gradient_norm = torch.nn.utils.clip_grad_norm_(
+            list(self.q1.parameters()) + list(self.q2.parameters()), self.gradient_clip_norm
+        )
+        encoder_gradient_norm = torch.nn.utils.clip_grad_norm_(self.encoder.parameters(), self.gradient_clip_norm)
         self.critic_optimizer.step()
         self.encoder_optimizer.step()
+        self._update_targets()
+        return {
+            "loss/critic": critic_loss.item(),
+            "loss/kl": kl_loss.item(),
+            "stats/critic_gradient_norm": float(critic_gradient_norm),
+            "stats/encoder_gradient_norm": float(encoder_gradient_norm),
+            "stats/target_q": target_q.mean().item(),
+            "stats/z_mean": posterior_mean.mean().item(),
+            "stats/z_std": torch.exp(0.5 * posterior_log_variance).mean().item(),
+            "stats/meta_batch_tasks": float(tasks),
+        }
+
+    def update(
+        self,
+        task_batch: TaskBatch,
+        demonstration_batch: TaskBatch | None = None,
+        bc_weight: float = 0.0,
+    ) -> dict[str, float]:
+        critic_metrics = self.update_critic(task_batch)
+        context = self._tensor(context_from_batch(task_batch.context, self.reward_scale))
+        observations = self._flatten(task_batch.rl.observations)
+        tasks, transitions = task_batch.rl.observations.shape[:2]
 
         # Recompute only to obtain a current, detached task posterior for SAC's actor update.
         with torch.no_grad():
             actor_mean, actor_log_variance = self.encoder(context)
-            actor_latents = self._expand_latents(self._sample_latents(actor_mean, actor_log_variance), transitions)
+            actor_task_latents = self._sample_latents(actor_mean, actor_log_variance)
+            actor_latents = self._expand_latents(actor_task_latents, transitions)
         sampled_actions, log_prob = self.actor(observations, actor_latents)
         q_value = torch.minimum(
             self.q1(observations, sampled_actions, actor_latents), self.q2(observations, sampled_actions, actor_latents)
         )
-        sac_actor_loss = (self.alpha.detach() * log_prob - q_value).mean()
+        q_scale = q_value.detach().abs().mean().clamp_min(1.0)
+        sac_actor_loss = (self.alpha.detach() * log_prob - q_value / q_scale).mean()
         bc_loss = torch.zeros((), device=self.device)
         if demonstration_batch is not None and bc_weight > 0:
             demo_observations = self._flatten(demonstration_batch.rl.observations)
@@ -197,31 +260,31 @@ class PEARLAgent:
             # context. Clone expert actions under that same latent instead of
             # a separate, clean expert-only context.
             with torch.no_grad():
-                demo_latents = self._expand_latents(actor_mean, demo_transitions)
-            predicted_demo_actions, _ = self.actor(demo_observations, demo_latents, deterministic=True)
-            bc_loss = F.mse_loss(predicted_demo_actions, demo_actions)
+                demo_latents = self._expand_latents(actor_task_latents, demo_transitions)
+            bc_loss, _, _ = self._behavior_cloning_loss(demo_observations, demo_actions, demo_latents)
         actor_loss = sac_actor_loss + bc_weight * bc_loss
         self.actor_optimizer.zero_grad()
         actor_loss.backward()
+        actor_gradient_norm = torch.nn.utils.clip_grad_norm_(self.actor.parameters(), self.gradient_clip_norm)
         self.actor_optimizer.step()
 
-        alpha_loss = -(self.log_alpha * (log_prob + self.target_entropy).detach()).mean()
-        self.alpha_optimizer.zero_grad()
-        alpha_loss.backward()
-        self.alpha_optimizer.step()
-        self._update_targets()
+        alpha_loss = torch.zeros((), device=self.device)
+        if self.alpha_optimizer is not None:
+            alpha_loss = -(self.log_alpha * (log_prob + self.target_entropy).detach()).mean()
+            self.alpha_optimizer.zero_grad()
+            alpha_loss.backward()
+            self.alpha_optimizer.step()
 
         return {
+            **critic_metrics,
             "loss/actor": actor_loss.item(),
             "loss/sac_actor": sac_actor_loss.item(),
             "loss/bc": bc_loss.item(),
-            "loss/critic": critic_loss.item(),
-            "loss/kl": kl_loss.item(),
             "loss/alpha": alpha_loss.item(),
             "stats/alpha": self.alpha.item(),
             "stats/q_value": q_value.mean().item(),
-            "stats/z_mean": posterior_mean.mean().item(),
-            "stats/z_std": torch.exp(0.5 * posterior_log_variance).mean().item(),
+            "stats/q_scale": q_scale.item(),
+            "stats/actor_gradient_norm": float(actor_gradient_norm),
             "stats/meta_batch_tasks": float(tasks),
         }
 
@@ -238,6 +301,14 @@ class PEARLAgent:
 
     def _tensor(self, array: np.ndarray) -> Tensor:
         return torch.as_tensor(array, dtype=torch.float32, device=self.device)
+
+    def _behavior_cloning_loss(
+        self, observations: Tensor, actions: Tensor, latents: Tensor
+    ) -> tuple[Tensor, Tensor, Tensor]:
+        predicted_actions, log_std = self.actor.deterministic_action_and_log_std(observations, latents)
+        action_loss = F.mse_loss(predicted_actions, actions)
+        spread_loss = F.mse_loss(log_std, torch.full_like(log_std, self.bc_log_std_target))
+        return action_loss + self.bc_log_std_weight * spread_loss, action_loss, spread_loss
 
     @staticmethod
     def _sample_latents(mean: Tensor, log_variance: Tensor) -> Tensor:

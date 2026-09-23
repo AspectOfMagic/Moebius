@@ -53,7 +53,21 @@ Phase 4 introduces hidden object dynamics.
   its actor and context encoder using chronological context windows of lengths
   1, 4, 8, 16, or 32, plus explicit empty-context (`z = 0`) training. It then
   uses persistent per-task demonstrations in mixed online/offline updates with
-  a cloning-loss floor instead of removing the expert anchor entirely.
+  a cloning-loss floor instead of removing the expert anchor entirely. Failed
+  scripted rollouts are discarded and retried, so the demonstration buffers
+  contain only successful complete trajectories. The collection cap defaults
+  to 20 attempts per requested trajectory and can be adjusted with
+  `--pearl-demo-max-attempts-per-task`.
+- PEARL now behavior-clones both the deterministic action and a conservative
+  policy spread, then warms up its critics on demonstrations before online
+  interaction. Online updates use scaled rewards, Huber critic losses,
+  gradient clipping, a fixed entropy coefficient, and a Q-normalized actor
+  objective so the cloning term cannot be overwhelmed by the critic scale.
+- One task latent is sampled and held fixed for each complete rollout. Tasks
+  are collected in short adaptation sequences, matching evaluation instead
+  of resampling a different latent at every environment step. A posterior
+  standard-deviation floor prevents the context encoder from becoming
+  arbitrarily overconfident.
 
 ## Setup
 
@@ -109,23 +123,27 @@ held-out dynamics are never added to a buffer.
 ```bash
 moebius-train --algorithm pearl --pearl-task-distribution dynamics \
   --num-train-tasks 20 --num-eval-tasks 10 \
-  --latent-dim 5 --context-size 32 --meta-batch-size 8 \
+  --latent-dim 5 --context-size 16 --meta-batch-size 8 \
   --mass-scale-min 0.5 --mass-scale-max 1.5 \
   --friction-scale-min 0.5 --friction-scale-max 1.5 \
-  --pearl-demo-episodes-per-task 2 --pearl-bc-pretrain-updates 5000 \
-  --demo-batch-fraction 0.25 --bc-weight 1.0 --bc-decay-steps 250000 \
-  --pearl-bc-weight-floor 0.1 --context-episodes-per-task 64 \
+  --pearl-demo-episodes-per-task 5 --pearl-bc-pretrain-updates 5000 \
+  --pearl-critic-pretrain-updates 5000 \
+  --demo-batch-fraction 0.25 --bc-weight 1.0 --bc-decay-steps 500000 \
+  --pearl-bc-weight-floor 0.2 --context-episodes-per-task 64 \
+  --pearl-reward-scale 0.1 --pearl-fixed-alpha 0.1 \
   --total-steps 1000000
 ```
 
 Set `--pearl-demo-episodes-per-task 0` to run the original random-exploration
 PEARL variant. TensorBoard logs `demo/pearl_*`, `pretrain/pearl_bc_loss`,
-`loss/bc`, and `schedule/pearl_bc_weight` alongside adaptation success.
+`pretrain/pearl_critic_loss`, `pretrain/pearl_joint_bc_loss`, gradient norms,
+target/Q scales, `loss/bc`, and `schedule/pearl_bc_weight` alongside adaptation
+success.
 
 The context buffers preserve episode order. During online fine-tuning, expert
-actions are cloned under the learner's own current task context, not a
-separate clean expert context. This aligns the latent used during training
-with the empty/partial context available at deployment.
+actions are cloned under the learner's own sampled task latent, not a separate
+clean expert context. That latent remains fixed during a rollout and is
+updated between adaptation episodes, matching deployment.
 
 ## Run the legacy Phase 2 goal task distribution
 

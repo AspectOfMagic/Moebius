@@ -4,7 +4,7 @@ import torch
 from moebius.config import TrainConfig
 from moebius.envs import DynamicsTaskSampler, GoalTaskSampler
 from moebius.networks import ContextEncoder
-from moebius.pearl import PEARLAgent, context_from_batch
+from moebius.pearl import PEARLAgent, context_from_batch, context_transition
 from moebius.networks import SquashedGaussianActor
 from moebius.replay_buffer import (
     MultiTaskReplayBuffer,
@@ -63,6 +63,33 @@ def test_task_context_buffer_preserves_chronological_prefixes() -> None:
     assert np.all(np.diff(batch.observations[:, :, 0], axis=1) == 1)
 
 
+def test_failed_expert_trajectory_can_be_discarded_before_buffer_commit() -> None:
+    """Demonstration collection must not add a trajectory until it is accepted."""
+    replay = MultiTaskReplayBuffer((0,), observation_dim=2, action_dim=1, capacity=8)
+    contexts = TaskTrajectoryContextBuffer((0,), max_episodes_per_task=2, seed=2)
+    failed_trajectory = [
+        (np.array([0.0, 0.0]), np.array([0.0]), 1.0, np.array([1.0, 0.0]), False),
+        (np.array([1.0, 0.0]), np.array([0.0]), 1.0, np.array([2.0, 0.0]), False),
+    ]
+    successful_trajectory = [
+        (np.array([3.0, 0.0]), np.array([0.0]), 1.0, np.array([4.0, 0.0]), False),
+        (np.array([4.0, 0.0]), np.array([0.0]), 1.0, np.array([5.0, 0.0]), True),
+    ]
+
+    # This mirrors a failed collection attempt: it is intentionally never committed.
+    assert replay.size(0) == 0
+    contexts.begin_episode(0)
+    for transition in successful_trajectory:
+        replay.add(0, *transition)
+        contexts.add(0, *transition)
+    contexts.end_episode(0)
+
+    assert len(failed_trajectory) == 2
+    assert replay.size(0) == len(successful_trajectory)
+    batch = contexts.sample_prefixes(np.array([0]), max_context_size=2)
+    assert np.all(batch.observations[:, :, 0] >= 3.0)
+
+
 def test_sac_update_produces_finite_metrics() -> None:
     buffer = ReplayBuffer(3, 2, capacity=32)
     for _ in range(32):
@@ -106,6 +133,25 @@ def test_context_encoder_is_permutation_invariant() -> None:
     assert torch.allclose(log_variance, reordered_log_variance)
 
 
+def test_context_encoder_respects_posterior_std_floor() -> None:
+    encoder = ContextEncoder(context_dim=5, latent_dim=2, hidden_dim=8, min_posterior_std=0.2)
+    with torch.no_grad():
+        for parameter in encoder.parameters():
+            parameter.zero_()
+        encoder.network[-1].bias[2:] = -10.0
+
+    _, log_variance = encoder(torch.zeros(1, 32, 5))
+
+    assert torch.all(torch.exp(0.5 * log_variance) >= 0.2 - 1e-6)
+
+
+def test_pearl_context_reward_is_scaled() -> None:
+    transition = context_transition(
+        np.array([1.0, 2.0]), np.array([0.5]), 10.0, np.array([3.0, 4.0]), reward_scale=0.1
+    )
+    assert transition[3] == 1.0
+
+
 def test_multitask_buffer_and_pearl_update_produce_finite_metrics() -> None:
     observation_dim, action_dim = 3, 2
     buffer = MultiTaskReplayBuffer(range(3), observation_dim, action_dim, capacity=32)
@@ -142,6 +188,7 @@ def test_demonstration_augmented_pearl_updates() -> None:
     demo_batch = demonstrations.sample_meta_batch_for_task_ids(online_batch.task_ids, batch_size=4, context_size=6)
     mixed_batch = concatenate_task_batch_rl(online_batch, demo_batch)
     agent = PEARLAgent(observation_dim, np.full(action_dim, -1.0), np.full(action_dim, 1.0), latent_dim=4, hidden_dim=16)
+    initial_alpha = agent.alpha.item()
 
     pretrain_metrics = agent.behavior_clone(demo_batch)
     prior_pretrain_metrics = agent.behavior_clone(demo_batch, prior_context=True)
@@ -152,4 +199,7 @@ def test_demonstration_augmented_pearl_updates() -> None:
     assert all(np.isfinite(value) for value in prior_pretrain_metrics.values())
     assert all(np.isfinite(value) for value in metrics.values())
     assert metrics["loss/bc"] >= 0
+    assert metrics["loss/alpha"] == 0
+    assert metrics["stats/q_scale"] >= 1
+    assert agent.alpha.item() == initial_alpha
     assert pearl_online_bc_weight(TrainConfig(bc_weight=1.0, bc_decay_steps=100, pearl_bc_weight_floor=0.1), 100) == 0.1

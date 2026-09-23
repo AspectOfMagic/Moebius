@@ -71,6 +71,10 @@ def load_pearl_agent(checkpoint: dict[str, Any], environment: MetaWorldSingleTas
         action_high=environment.action_space.high,
         latent_dim=int(config["latent_dim"]),
         hidden_dim=int(config["hidden_dim"]),
+        reward_scale=float(config.get("pearl_reward_scale", 1.0)),
+        fixed_alpha=float(config.get("pearl_fixed_alpha", 0.1)),
+        gradient_clip_norm=float(config.get("gradient_clip_norm", 10.0)),
+        min_posterior_std=float(config.get("min_posterior_std", 0.05)),
         device=device,
     )
     state = checkpoint["agent"]
@@ -140,16 +144,21 @@ def record_pearl_episode(
 ) -> tuple[float, bool]:
     """Record one context-collection or adapted PEARL rollout on one task."""
     observation = _reset_task(environment, task)
+    initial_context = np.asarray(context, dtype=np.float32) if context else None
+    episode_latent = agent.infer_latent(initial_context, deterministic=deterministic)
     episode_return = 0.0
     terminated = truncated = False
     info: dict[str, Any] = {}
     with imageio.get_writer(video_path, fps=fps) as writer:
         _append_frame(writer, environment)
         while not (terminated or truncated):
-            current_context = np.asarray(context, dtype=np.float32) if context else None
-            action = agent.act(observation, current_context, deterministic=deterministic)
+            action = agent.act(observation, deterministic=deterministic, latent=episode_latent)
             next_observation, reward, terminated, truncated, info = environment.step(action)
-            _append_context(context, context_transition(observation, action, reward, next_observation), context_size)
+            _append_context(
+                context,
+                context_transition(observation, action, reward, next_observation, agent.reward_scale),
+                context_size,
+            )
             observation = next_observation
             episode_return += reward
             _append_frame(writer, environment)
