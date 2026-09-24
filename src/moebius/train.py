@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import argparse
 import random
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
 from pathlib import Path
 
 import numpy as np
@@ -76,12 +76,8 @@ def parse_args() -> TrainConfig:
         "--pearl-task-distribution",
         choices=("goal", "dynamics"),
         default="dynamics",
-        help="PEARL task distribution: hidden mass/friction dynamics (Phase 4) or legacy fixed goals (Phase 2).",
+        help="PEARL task distribution: hidden object properties or legacy fixed goals.",
     )
-    parser.add_argument("--mass-scale-min", type=float, default=0.5)
-    parser.add_argument("--mass-scale-max", type=float, default=1.5)
-    parser.add_argument("--friction-scale-min", type=float, default=0.5)
-    parser.add_argument("--friction-scale-max", type=float, default=1.5)
     parser.add_argument(
         "--pearl-demo-episodes-per-task",
         type=int,
@@ -343,7 +339,7 @@ def train_sac(config: TrainConfig) -> None:
 
 
 def _reset_task(environment: MetaWorldSingleTaskEnv, task: TaskSpec) -> np.ndarray:
-    environment.set_object_dynamics(task.mass_scale, task.friction_scale)
+    environment.set_task_properties(task)
     if task.reset_seed is None:
         observation, _ = environment.reset()
     else:
@@ -360,101 +356,135 @@ def _pearl_task_sampler(config: TrainConfig) -> GoalTaskSampler | DynamicsTaskSa
         return DynamicsTaskSampler(
             config.num_train_tasks,
             config.num_eval_tasks,
-            mass_scale_min=config.mass_scale_min,
-            mass_scale_max=config.mass_scale_max,
-            friction_scale_min=config.friction_scale_min,
-            friction_scale_max=config.friction_scale_max,
+            object_radius_min=config.object_radius_min,
+            object_radius_max=config.object_radius_max,
+            object_height_min=config.object_height_min,
+            object_height_max=config.object_height_max,
+            object_mass_min=config.object_mass_min,
+            object_mass_max=config.object_mass_max,
+            object_table_friction_min=config.object_table_friction_min,
+            object_table_friction_max=config.object_table_friction_max,
+            object_finger_friction_min=config.object_finger_friction_min,
+            object_finger_friction_max=config.object_finger_friction_max,
+            contact_softness_min=config.contact_softness_min,
+            contact_softness_max=config.contact_softness_max,
             seed=config.seed,
         )
     raise ValueError(f"Unsupported PEARL task distribution: {config.pearl_task_distribution}")
 
 
-def collect_pearl_demonstrations(
+Trajectory = list[tuple[np.ndarray, np.ndarray, float, np.ndarray, bool]]
+
+
+@dataclass
+class FeasibleDynamicsData:
+    sampler: DynamicsTaskSampler
+    demonstrations: MultiTaskReplayBuffer | None
+    contexts: TaskTrajectoryContextBuffer | None
+
+
+def collect_feasible_dynamics_data(
     config: TrainConfig,
-    tasks: tuple[TaskSpec, ...],
+    sampler: DynamicsTaskSampler,
     observation_dim: int,
     action_dim: int,
     writer: SummaryWriter,
-) -> tuple[MultiTaskReplayBuffer, TaskTrajectoryContextBuffer] | None:
-    """Collect persistent expert trajectories for every PEARL train task."""
-    episodes_per_task = config.pearl_demo_episodes_per_task
-    if episodes_per_task == 0:
-        return None
-    if episodes_per_task < 0:
-        raise ValueError("--pearl-demo-episodes-per-task must be non-negative.")
-    if config.pearl_demo_max_attempts_per_task < episodes_per_task:
-        raise ValueError(
-            "--pearl-demo-max-attempts-per-task must be at least "
-            "--pearl-demo-episodes-per-task."
-        )
-    if config.env_name != "pick-place-v3":
-        raise ValueError("PEARL demonstrations currently support only --env-name pick-place-v3.")
+) -> FeasibleDynamicsData:
+    """Find solvable property vectors and retain their successful rollouts.
 
-    buffer = MultiTaskReplayBuffer(
-        (task.task_id for task in tasks),
+    A candidate must produce ``pearl_demo_episodes_per_task`` successes within
+    ``pearl_demo_max_attempts_per_task`` attempts. Those same trajectories are
+    committed to the demonstration/context buffers, so no second collection
+    pass can fail merely because later resets are less favorable.
+    """
+    required_successes = config.pearl_demo_episodes_per_task
+    max_attempts = config.pearl_demo_max_attempts_per_task
+    if required_successes == 0:
+        return FeasibleDynamicsData(sampler, None, None)
+    if required_successes < 0:
+        raise ValueError("--pearl-demo-episodes-per-task must be non-negative.")
+    if max_attempts < required_successes:
+        raise ValueError("--pearl-demo-max-attempts-per-task must be at least --pearl-demo-episodes-per-task.")
+    if config.max_property_candidates_per_task < 1:
+        raise ValueError("max_property_candidates_per_task must be positive.")
+
+    demonstrations = MultiTaskReplayBuffer(
+        (task.task_id for task in sampler.train_tasks),
         observation_dim,
         action_dim,
-        episodes_per_task * config.max_episode_steps,
+        required_successes * config.max_episode_steps,
         config.seed + 20_000,
     )
     contexts = TaskTrajectoryContextBuffer(
-        (task.task_id for task in tasks), config.context_episodes_per_task, config.seed + 30_000
+        (task.task_id for task in sampler.train_tasks), config.context_episodes_per_task, config.seed + 30_000
     )
     environment = MetaWorldSingleTaskEnv(config.env_name, config.seed + 3, config.max_episode_steps)
     expert = _pick_place_expert()
-    total_successes = 0
-    total_attempts = 0
-    try:
-        for task in tasks:
-            task_successes = 0
-            task_attempts = 0
-            while (
-                task_successes < episodes_per_task
-                and task_attempts < config.pearl_demo_max_attempts_per_task
-            ):
-                task_attempts += 1
-                observation = _reset_task(environment, task)
-                terminated = truncated = False
-                episode_return = 0.0
-                info: dict[str, float] = {}
-                trajectory: list[tuple[np.ndarray, np.ndarray, float, np.ndarray, bool]] = []
-                while not (terminated or truncated):
-                    action = np.asarray(expert.get_action(observation), dtype=np.float32)
-                    action = np.clip(action, environment.action_space.low, environment.action_space.high)
-                    next_observation, reward, terminated, truncated, info = environment.step(action)
-                    trajectory.append((observation, action, reward, next_observation, terminated))
-                    observation = next_observation
-                    episode_return += reward
-                success = float(info.get("success", False))
-                task_successes += int(success)
-                writer.add_scalar(f"demo/task_{task.task_id}_return", episode_return, task_attempts)
-                writer.add_scalar(f"demo/task_{task.task_id}_success", success, task_attempts)
-                if success:
-                    # A failed scripted rollout is not an expert demonstration.
-                    # Keep the replay and the chronological context buffer aligned
-                    # by committing the entire trajectory only after success.
-                    contexts.begin_episode(task.task_id)
-                    for transition in trajectory:
-                        buffer.add(task.task_id, *transition)
-                        contexts.add(task.task_id, *transition)
-                    contexts.end_episode(task.task_id)
-            total_attempts += task_attempts
-            total_successes += task_successes
-            if task_successes != episodes_per_task:
+
+    def successful_trajectories(task: TaskSpec, split: str) -> tuple[list[Trajectory], int]:
+        trajectories: list[Trajectory] = []
+        for attempt in range(1, max_attempts + 1):
+            observation = _reset_task(environment, task)
+            terminated = truncated = False
+            episode_return = 0.0
+            info: dict[str, float] = {}
+            trajectory: Trajectory = []
+            while not (terminated or truncated):
+                action = np.asarray(expert.get_action(observation), dtype=np.float32)
+                action = np.clip(action, environment.action_space.low, environment.action_space.high)
+                next_observation, reward, terminated, truncated, info = environment.step(action)
+                trajectory.append((observation, action, reward, next_observation, terminated))
+                observation = next_observation
+                episode_return += reward
+            success = float(info.get("success", False))
+            metric_prefix = "demo" if split == "train" else "feasibility"
+            writer.add_scalar(f"{metric_prefix}/{split}_task_{task.task_id}_return", episode_return, attempt)
+            writer.add_scalar(f"{metric_prefix}/{split}_task_{task.task_id}_success", success, attempt)
+            if success:
+                trajectories.append(trajectory)
+                if len(trajectories) == required_successes:
+                    return trajectories, attempt
+        return trajectories, max_attempts
+
+    def accept_tasks(tasks: tuple[TaskSpec, ...], split: str, retain: bool) -> tuple[TaskSpec, ...]:
+        accepted_tasks: list[TaskSpec] = []
+        for original_task in tasks:
+            candidate = original_task
+            for candidate_index in range(1, config.max_property_candidates_per_task + 1):
+                trajectories, attempts = successful_trajectories(candidate, split)
+                if len(trajectories) == required_successes:
+                    accepted_tasks.append(candidate)
+                    print(
+                        f"feasibility {split} task={candidate.task_id}: accepted candidate "
+                        f"{candidate_index}/{config.max_property_candidates_per_task} "
+                        f"({required_successes}/{attempts} expert successes)"
+                    )
+                    if retain:
+                        for trajectory in trajectories:
+                            contexts.begin_episode(candidate.task_id)
+                            for transition in trajectory:
+                                demonstrations.add(candidate.task_id, *transition)
+                                contexts.add(candidate.task_id, *transition)
+                            contexts.end_episode(candidate.task_id)
+                    writer.add_scalar(f"demo/{split}_task_{candidate.task_id}_attempts", attempts, 0)
+                    break
+                candidate = sampler.resample_task(original_task.task_id)
+            else:
                 raise RuntimeError(
-                    f"Collected only {task_successes}/{episodes_per_task} successful expert rollouts for PEARL "
-                    f"task {task.task_id} after {task_attempts}/{config.pearl_demo_max_attempts_per_task} attempts."
+                    f"Could not find a {split} task with {required_successes} successful expert rollouts after "
+                    f"{config.max_property_candidates_per_task} property candidates. Relax the property bounds or "
+                    "increase max_property_candidates_per_task."
                 )
-            writer.add_scalar(f"demo/task_{task.task_id}_attempts", task_attempts, 0)
-            writer.add_scalar(f"demo/task_{task.task_id}_attempt_success_rate", task_successes / task_attempts, 0)
+        return tuple(accepted_tasks)
+
+    try:
+        sampler.train_tasks = accept_tasks(sampler.train_tasks, "train", retain=True)
+        sampler.test_tasks = accept_tasks(sampler.test_tasks, "test", retain=False)
     finally:
         environment.close()
 
-    writer.add_scalar("demo/pearl_success_rate", total_successes / (len(tasks) * episodes_per_task), 0)
-    writer.add_scalar("demo/pearl_attempt_success_rate", total_successes / total_attempts, 0)
-    writer.add_scalar("demo/pearl_attempts", total_attempts, 0)
-    writer.add_scalar("demo/pearl_transitions", sum(buffer.size(task.task_id) for task in tasks), 0)
-    return buffer, contexts
+    writer.add_scalar("demo/pearl_transitions", sum(demonstrations.size(task.task_id) for task in sampler.train_tasks), 0)
+    return FeasibleDynamicsData(sampler, demonstrations, contexts)
 
 
 def contextualize_task_batch(
@@ -549,6 +579,15 @@ def train_pearl(config: TrainConfig) -> None:
     task_sampler = _pearl_task_sampler(config)
     observation_dim = int(np.prod(environment.observation_space.shape))
     action_dim = int(np.prod(environment.action_space.shape))
+    run_name = f"{config.env_name}_pearl_seed{config.seed}"
+    writer = SummaryWriter(config.log_dir / run_name)
+    writer.add_text("config", str(asdict(config)))
+    demonstration_data: tuple[MultiTaskReplayBuffer, TaskTrajectoryContextBuffer] | None = None
+    if isinstance(task_sampler, DynamicsTaskSampler):
+        feasible_data = collect_feasible_dynamics_data(config, task_sampler, observation_dim, action_dim, writer)
+        task_sampler = feasible_data.sampler
+        if feasible_data.demonstrations is not None and feasible_data.contexts is not None:
+            demonstration_data = feasible_data.demonstrations, feasible_data.contexts
     agent = PEARLAgent(
         observation_dim=observation_dim,
         action_low=environment.action_space.low,
@@ -574,13 +613,6 @@ def train_pearl(config: TrainConfig) -> None:
     )
     online_contexts = TaskTrajectoryContextBuffer(
         (task.task_id for task in task_sampler.train_tasks), config.context_episodes_per_task, config.seed + 40_000
-    )
-    run_name = f"{config.env_name}_pearl_seed{config.seed}"
-    writer = SummaryWriter(config.log_dir / run_name)
-    writer.add_text("config", str(asdict(config)))
-
-    demonstration_data = collect_pearl_demonstrations(
-        config, task_sampler.train_tasks, observation_dim, action_dim, writer
     )
     demonstrations: MultiTaskReplayBuffer | None = None
     if demonstration_data is not None:
@@ -707,7 +739,19 @@ def train_pearl(config: TrainConfig) -> None:
                 )
     finally:
         config.checkpoint_dir.mkdir(parents=True, exist_ok=True)
-        torch.save({"config": asdict(config), "agent": agent.state_dict()}, config.checkpoint_dir / f"{run_name}.pt")
+        torch.save(
+            {
+                "config": asdict(config),
+                "agent": agent.state_dict(),
+                # Filtering replaces random candidates, so persist the exact
+                # accepted vectors for reproducible evaluation and recording.
+                "task_specs": {
+                    "train": [asdict(task) for task in task_sampler.train_tasks],
+                    "test": [asdict(task) for task in task_sampler.test_tasks],
+                },
+            },
+            config.checkpoint_dir / f"{run_name}.pt",
+        )
         writer.close()
         environment.close()
         evaluation_environment.close()

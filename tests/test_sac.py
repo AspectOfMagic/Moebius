@@ -37,14 +37,73 @@ def test_phase_three_defaults_to_pick_and_place_with_disjoint_task_configs() -> 
     )
 
 
-def test_dynamics_tasks_hide_disjoint_mass_and_friction_pairs() -> None:
-    sampler = DynamicsTaskSampler(3, 2, mass_scale_min=0.5, mass_scale_max=1.5, friction_scale_min=0.5, friction_scale_max=1.5, seed=9)
-    train_parameters = {(task.mass_scale, task.friction_scale) for task in sampler.train_tasks}
-    test_parameters = {(task.mass_scale, task.friction_scale) for task in sampler.test_tasks}
+def test_dynamics_tasks_hide_disjoint_diverse_object_property_vectors() -> None:
+    sampler = DynamicsTaskSampler(
+        3,
+        2,
+        object_radius_min=0.01,
+        object_radius_max=0.02,
+        object_height_min=0.02,
+        object_height_max=0.04,
+        object_mass_min=0.2,
+        object_mass_max=1.0,
+        object_table_friction_min=0.1,
+        object_table_friction_max=1.0,
+        object_finger_friction_min=0.2,
+        object_finger_friction_max=2.0,
+        contact_softness_min=0.005,
+        contact_softness_max=0.02,
+        seed=9,
+    )
+    train_parameters = {
+        (
+            task.object_radius,
+            task.object_height,
+            task.object_mass,
+            task.object_table_friction,
+            task.object_finger_friction,
+            task.contact_softness,
+        )
+        for task in sampler.train_tasks
+    }
+    test_parameters = {
+        (
+            task.object_radius,
+            task.object_height,
+            task.object_mass,
+            task.object_table_friction,
+            task.object_finger_friction,
+            task.contact_softness,
+        )
+        for task in sampler.test_tasks
+    }
 
     assert train_parameters.isdisjoint(test_parameters)
     assert all(task.reset_seed is None for task in sampler.train_tasks + sampler.test_tasks)
-    assert all(0.5 <= mass <= 1.5 and 0.5 <= friction <= 1.5 for mass, friction in train_parameters | test_parameters)
+    assert all(
+        0.01 <= radius <= 0.02
+        and 0.02 <= height <= 0.04
+        and 0.2 <= mass <= 1.0
+        and 0.1 <= table_friction <= 1.0
+        and 0.2 <= finger_friction <= 2.0
+        and 0.005 <= softness <= 0.02
+        for radius, height, mass, table_friction, finger_friction, softness in train_parameters | test_parameters
+    )
+
+
+def test_dynamics_task_resampling_preserves_task_id_and_bounds() -> None:
+    sampler = DynamicsTaskSampler(1, 1, object_radius_min=0.01, object_radius_max=0.02, seed=4)
+
+    replacement = sampler.resample_task(task_id=17)
+
+    assert replacement.task_id == 17
+    assert replacement.reset_seed is None
+    assert 0.01 <= replacement.object_radius <= 0.02
+    assert replacement.object_height is not None
+    assert replacement.object_mass is not None
+    assert replacement.object_table_friction is not None
+    assert replacement.object_finger_friction is not None
+    assert replacement.contact_softness is not None
 
 
 def test_task_context_buffer_preserves_chronological_prefixes() -> None:

@@ -99,7 +99,7 @@ def _append_context(context: list[np.ndarray], transition: np.ndarray, context_s
 
 
 def _reset_task(environment: MetaWorldSingleTaskEnv, task: TaskSpec) -> np.ndarray:
-    environment.set_object_dynamics(task.mass_scale, task.friction_scale)
+    environment.set_task_properties(task)
     if task.reset_seed is None:
         observation, _ = environment.reset()
     else:
@@ -166,33 +166,49 @@ def record_pearl_episode(
 
 
 def record_pearl(
-    agent: PEARLAgent, environment: MetaWorldSingleTaskEnv, config: dict[str, Any], args: argparse.Namespace
+    agent: PEARLAgent,
+    environment: MetaWorldSingleTaskEnv,
+    config: dict[str, Any],
+    args: argparse.Namespace,
+    task_specs: dict[str, list[dict[str, Any]]] | None = None,
 ) -> None:
-    if config.get("pearl_task_distribution", "goal") == "dynamics":
+    if task_specs is not None:
+        test_tasks = tuple(TaskSpec(**task) for task in task_specs["test"])
+    elif config.get("pearl_task_distribution", "goal") == "dynamics":
         sampler = DynamicsTaskSampler(
             num_train_tasks=int(config["num_train_tasks"]),
             num_test_tasks=int(config["num_eval_tasks"]),
-            mass_scale_min=float(config.get("mass_scale_min", 0.5)),
-            mass_scale_max=float(config.get("mass_scale_max", 1.5)),
-            friction_scale_min=float(config.get("friction_scale_min", 0.5)),
-            friction_scale_max=float(config.get("friction_scale_max", 1.5)),
+            object_radius_min=float(config.get("object_radius_min", 0.008)),
+            object_radius_max=float(config.get("object_radius_max", 0.028)),
+            object_height_min=float(config.get("object_height_min", 0.016)),
+            object_height_max=float(config.get("object_height_max", 0.080)),
+            object_mass_min=float(config.get("object_mass_min", 0.10)),
+            object_mass_max=float(config.get("object_mass_max", 2.00)),
+            object_table_friction_min=float(config.get("object_table_friction_min", 0.05)),
+            object_table_friction_max=float(config.get("object_table_friction_max", 4.00)),
+            object_finger_friction_min=float(config.get("object_finger_friction_min", 0.05)),
+            object_finger_friction_max=float(config.get("object_finger_friction_max", 4.00)),
+            contact_softness_min=float(config.get("contact_softness_min", 0.004)),
+            contact_softness_max=float(config.get("contact_softness_max", 0.060)),
             seed=int(config["seed"]),
         )
+        test_tasks = sampler.test_tasks
     else:
         sampler = GoalTaskSampler(
             num_train_tasks=int(config["num_train_tasks"]),
             num_test_tasks=int(config["num_eval_tasks"]),
             seed=int(config["seed"]),
         )
-    if not 0 <= args.task_index < len(sampler.test_tasks):
-        raise ValueError(f"--task-index must be in [0, {len(sampler.test_tasks) - 1}].")
+        test_tasks = sampler.test_tasks
+    if not 0 <= args.task_index < len(test_tasks):
+        raise ValueError(f"--task-index must be in [0, {len(test_tasks) - 1}].")
     adaptation_episodes = (
         int(config["adaptation_episodes"]) if args.adaptation_episodes is None else args.adaptation_episodes
     )
     if adaptation_episodes < 0:
         raise ValueError("--adaptation-episodes must be non-negative.")
 
-    task = sampler.test_tasks[args.task_index]
+    task = test_tasks[args.task_index]
     context: list[np.ndarray] = []
     context_size = int(config["context_size"])
     name_prefix = f"{config['env_name']}_pearl_task{args.task_index}"
@@ -235,7 +251,13 @@ def record(args: argparse.Namespace) -> None:
         if algorithm == "sac":
             record_sac(load_actor(checkpoint, environment, device), environment, config, args, device)
         else:
-            record_pearl(load_pearl_agent(checkpoint, environment, device), environment, config, args)
+            record_pearl(
+                load_pearl_agent(checkpoint, environment, device),
+                environment,
+                config,
+                args,
+                checkpoint.get("task_specs"),
+            )
     finally:
         environment.close()
 

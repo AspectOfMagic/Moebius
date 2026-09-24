@@ -3,7 +3,7 @@
 State-based reinforcement-learning experiments for robot manipulation. Phase 1
 is a Soft Actor-Critic (SAC) baseline, Phase 2 adds PEARL latent-task
 inference, Phase 3 applies that pipeline to MetaWorld pick-and-place, and
-Phase 4 introduces hidden object dynamics.
+Phase 4 introduces hidden object properties.
 
 
 ## Included in Phase 1
@@ -42,22 +42,24 @@ Phase 4 introduces hidden object dynamics.
 
 ## Included in Phase 4 — Hidden object properties
 
-- Each PEARL task fixes an unobserved object mass scale and sliding-friction
-  scale. The default train/test range is 0.5–1.5 times MetaWorld's nominal
-  value, with independently sampled and disjoint train/test parameter pairs.
+- Each PEARL task fixes an unobserved cylinder radius, height, mass,
+  object/table friction, object/finger friction, and contact softness. The
+  default bounds are deliberately broad and stored in `TrainConfig`, with
+  independently sampled and disjoint train/test property vectors.
+- Before training, each candidate property vector must yield
+  `pearl_demo_episodes_per_task` successful scripted rollouts within
+  `pearl_demo_max_attempts_per_task` attempts. Candidates that fail are
+  resampled; successful training rollouts are retained directly as the PEARL
+  demonstration buffer. The exact accepted train/test vectors are saved in the
+  checkpoint.
 - Object and goal positions are still randomized on every reset within each
   task. This ensures that PEARL must infer dynamics from transitions rather
   than using a visible configuration as a task label.
-- Before online training, MetaWorld's scripted pick-and-place expert collects
-  demonstrations for every training dynamics task. PEARL behavior-clones both
-  its actor and context encoder using chronological context windows of lengths
-  1, 4, 8, 16, or 32, plus explicit empty-context (`z = 0`) training. It then
-  uses persistent per-task demonstrations in mixed online/offline updates with
-  a cloning-loss floor instead of removing the expert anchor entirely. Failed
-  scripted rollouts are discarded and retried, so the demonstration buffers
-  contain only successful complete trajectories. The collection cap defaults
-  to 20 attempts per requested trajectory and can be adjusted with
-  `--pearl-demo-max-attempts-per-task`.
+- PEARL behavior-clones both its actor and context encoder using chronological
+  context windows of lengths 1, 4, 8, 16, or 32, plus explicit empty-context
+  (`z = 0`) training. It then uses the retained task-specific demonstrations
+  in mixed online/offline updates with a cloning-loss floor instead of removing
+  the expert anchor entirely.
 - PEARL now behavior-clones both the deterministic action and a conservative
   policy spread, then warms up its critics on demonstrations before online
   interaction. Online updates use scaled rewards, Huber critic losses,
@@ -113,19 +115,20 @@ To retain the original pure-SAC baseline, disable demonstrations explicitly:
 moebius-train --algorithm sac --total-steps 1000000 --demo-episodes 0
 ```
 
-## Train PEARL with hidden mass and friction
+## Train PEARL with hidden object properties
 
-Object and goal state is observable, but mass and sliding friction are not.
-The context encoder must infer useful dynamics information from `(s, a, r,
-s')` transitions. The expert demonstrations are restricted to training tasks;
-held-out dynamics are never added to a buffer.
+Each task samples a hidden cylinder radius, height, mass, object/table
+friction, object/finger friction, and contact softness. The intentionally wide
+bounds are stored in `TrainConfig`, rather than exposed as training-command
+flags, so they remain part of each experiment's saved configuration. Object
+and goal positions are randomized per reset; PEARL must infer task properties
+from `(s, a, r, s')` transitions. Expert demonstrations are restricted to
+training tasks; held-out dynamics are never added to a buffer.
 
 ```bash
 moebius-train --algorithm pearl --pearl-task-distribution dynamics \
   --num-train-tasks 20 --num-eval-tasks 10 \
   --latent-dim 5 --context-size 16 --meta-batch-size 8 \
-  --mass-scale-min 0.5 --mass-scale-max 1.5 \
-  --friction-scale-min 0.5 --friction-scale-max 1.5 \
   --pearl-demo-episodes-per-task 5 --pearl-bc-pretrain-updates 5000 \
   --pearl-critic-pretrain-updates 5000 \
   --demo-batch-fraction 0.25 --bc-weight 1.0 --bc-decay-steps 500000 \

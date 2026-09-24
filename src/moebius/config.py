@@ -36,10 +36,26 @@ class TrainConfig:
     bc_weight: float = 1.0
     bc_decay_steps: int = 250_000
     pearl_task_distribution: str = "dynamics"
-    mass_scale_min: float = 0.5
-    mass_scale_max: float = 1.5
-    friction_scale_min: float = 0.5
-    friction_scale_max: float = 1.5
+    # Bounds for PEARL's hidden object-property distribution. These deliberately
+    # live in configuration rather than the CLI: they define the experiment's
+    # task family and must be saved with the checkpoint.
+    object_radius_min: float = 0.015
+    object_radius_max: float = 0.025
+    object_height_min: float = 0.025
+    object_height_max: float = 0.055
+    object_mass_min: float = 0.25
+    object_mass_max: float = 1.25
+    object_table_friction_min: float = 0.25
+    object_table_friction_max: float = 2.00
+    object_finger_friction_min: float = 1.00
+    object_finger_friction_max: float = 3.00
+    # MuJoCo solref's positive time-constant parameter: higher values create
+    # softer contacts. The lower bound remains above the simulation timestep.
+    contact_softness_min: float = 0.008
+    contact_softness_max: float = 0.060
+    # Number of distinct property vectors tried when finding one that can
+    # yield the requested expert demonstrations.
+    max_property_candidates_per_task: int = 25
     pearl_demo_episodes_per_task: int = 2
     pearl_demo_max_attempts_per_task: int = 20
     pearl_bc_pretrain_updates: int = 5_000
@@ -52,7 +68,7 @@ class TrainConfig:
     context_episodes_per_task: int = 64
     latent_dim: int = 5
     encoder_lr: float = 3e-4
-    kl_weight: float = 0.1
+    kl_weight: float = 0.01
     num_train_tasks: int = 20
     num_eval_tasks: int = 10
     meta_batch_size: int = 8
