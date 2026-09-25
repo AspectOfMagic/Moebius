@@ -4,12 +4,14 @@ from __future__ import annotations
 
 from copy import deepcopy
 import math
+from typing import Sequence
 
 import numpy as np
 import torch
 from torch import Tensor
 from torch.nn import functional as F
 
+from moebius.context import ContextBuilder
 from moebius.networks import ContextEncoder, QNetwork, SquashedGaussianActor
 from moebius.replay_buffer import Batch, TaskBatch
 
@@ -64,10 +66,12 @@ class PEARLAgent:
         critic_lr: float = 3e-4,
         encoder_lr: float = 3e-4,
         alpha_lr: float = 3e-4,
-        kl_weight: float = 0.1,
+        kl_weight: float = 0.05,
+        kl_free_bits: float = 0.1,
         target_entropy: float | None = None,
         reward_scale: float = 0.1,
-        fixed_alpha: float | None = 0.1,
+        fixed_alpha: float | None = None,
+        initial_alpha: float = 0.02,
         gradient_clip_norm: float = 10.0,
         min_posterior_std: float = 0.05,
         device: str = "cpu",
@@ -85,8 +89,12 @@ class PEARLAgent:
             raise ValueError("reward_scale must be positive.")
         if fixed_alpha is not None and fixed_alpha <= 0:
             raise ValueError("fixed_alpha must be positive when supplied.")
+        if initial_alpha <= 0:
+            raise ValueError("initial_alpha must be positive.")
         if gradient_clip_norm <= 0:
             raise ValueError("gradient_clip_norm must be positive.")
+        if kl_free_bits < 0:
+            raise ValueError("kl_free_bits must be non-negative.")
         self.encoder = ContextEncoder(
             self.context_dim, latent_dim, hidden_dim, min_posterior_std=min_posterior_std
         ).to(self.device)
@@ -100,7 +108,10 @@ class PEARLAgent:
         self.actor_optimizer = torch.optim.Adam(self.actor.parameters(), lr=actor_lr)
         self.critic_optimizer = torch.optim.Adam(list(self.q1.parameters()) + list(self.q2.parameters()), lr=critic_lr)
         self.encoder_optimizer = torch.optim.Adam(self.encoder.parameters(), lr=encoder_lr)
-        initial_log_alpha = 0.0 if fixed_alpha is None else math.log(fixed_alpha)
+        # alpha is expressed in scaled-reward units (the same units as Q). With
+        # automatic tuning, start small so the behavior-cloned policy is not
+        # immediately pushed toward uniform random actions.
+        initial_log_alpha = math.log(initial_alpha if fixed_alpha is None else fixed_alpha)
         self.log_alpha = torch.tensor(
             [initial_log_alpha], device=self.device, requires_grad=fixed_alpha is None
         )
@@ -111,6 +122,9 @@ class PEARLAgent:
         self.gamma = gamma
         self.tau = tau
         self.kl_weight = kl_weight
+        # Nats per latent dimension that the KL term does not penalize, so the
+        # posterior is never pushed all the way back onto the prior.
+        self.kl_free_bits = kl_free_bits
         self.reward_scale = reward_scale
         self.gradient_clip_norm = gradient_clip_norm
         self.bc_log_std_target = -2.0
@@ -122,13 +136,45 @@ class PEARLAgent:
 
     @torch.no_grad()
     def infer_latent(self, context: np.ndarray | None, deterministic: bool = False) -> np.ndarray:
-        """Infer one task embedding. ``None``/empty context returns the prior."""
+        """Infer one task embedding. ``None``/empty context returns ``z = 0``.
+
+        The empty-context convention matches training, where ``k = 0``
+        previous episodes also uses ``z = 0``.
+        """
         if context is None or len(context) == 0:
             return np.zeros(self.latent_dim, dtype=np.float32)
         context_tensor = self._tensor(np.asarray(context, dtype=np.float32)).reshape(1, -1, self.context_dim)
         mean, log_variance = self.encoder(context_tensor)
         latent = mean if deterministic else mean + torch.exp(0.5 * log_variance) * torch.randn_like(mean)
         return latent.squeeze(0).cpu().numpy()
+
+    def latent_for_episode(
+        self,
+        previous_episodes: Sequence[Batch],
+        builder: ContextBuilder,
+        rng: np.random.Generator,
+        deterministic: bool = False,
+    ) -> tuple[np.ndarray, Batch | None]:
+        """The single deployment rule for choosing an episode's task latent.
+
+        The context is built from every completed episode earlier in the same
+        adaptation sequence (none for the first episode, giving ``z = 0``).
+        Training samples contexts with the same builder and the same notion of
+        "previous episodes", so the encoder sees matching inputs.
+        """
+        if not previous_episodes:
+            return np.zeros(self.latent_dim, dtype=np.float32), None
+        context = builder.build(previous_episodes, rng)
+        return self.infer_latent(context_from_batch(context, self.reward_scale), deterministic=deterministic), context
+
+    @torch.no_grad()
+    def posterior(self, context: np.ndarray | None) -> tuple[np.ndarray, np.ndarray]:
+        """Posterior mean and standard deviation, for logging adaptation."""
+        if context is None or len(context) == 0:
+            return np.zeros(self.latent_dim, dtype=np.float32), np.ones(self.latent_dim, dtype=np.float32)
+        context_tensor = self._tensor(np.asarray(context, dtype=np.float32)).reshape(1, -1, self.context_dim)
+        mean, log_variance = self.encoder(context_tensor)
+        return mean.squeeze(0).cpu().numpy(), torch.exp(0.5 * log_variance).squeeze(0).cpu().numpy()
 
     @torch.no_grad()
     def act(
@@ -154,7 +200,7 @@ class PEARLAgent:
         observations = self._flatten(task_batch.rl.observations)
         actions = self._flatten(task_batch.rl.actions)
         _, transitions = task_batch.rl.observations.shape[:2]
-        if prior_context:
+        if prior_context or task_batch.context.observations.shape[1] == 0:
             latents = torch.zeros((len(task_batch.task_ids) * transitions, self.latent_dim), device=self.device)
         else:
             context = self._tensor(context_from_batch(task_batch.context, self.reward_scale))
@@ -190,8 +236,16 @@ class PEARLAgent:
         dones = self._flatten(task_batch.rl.dones)
         tasks, transitions = task_batch.rl.observations.shape[:2]
 
-        posterior_mean, posterior_log_variance = self.encoder(context)
-        latents = self._sample_latents(posterior_mean, posterior_log_variance)
+        empty_context = context.shape[1] == 0
+        if empty_context:
+            # First episode of an adaptation sequence: act under z = 0 exactly
+            # as rollouts do. No encoder or KL gradient in this case.
+            posterior_mean = torch.zeros((tasks, self.latent_dim), device=self.device)
+            posterior_log_variance = torch.zeros_like(posterior_mean)
+            latents = posterior_mean
+        else:
+            posterior_mean, posterior_log_variance = self.encoder(context)
+            latents = self._sample_latents(posterior_mean, posterior_log_variance)
         expanded_latents = self._expand_latents(latents, transitions)
         with torch.no_grad():
             next_actions, next_log_prob = self.actor(next_observations, expanded_latents)
@@ -206,8 +260,12 @@ class PEARLAgent:
         q1_loss = F.smooth_l1_loss(q1, target_q)
         q2_loss = F.smooth_l1_loss(q2, target_q)
         critic_loss = q1_loss + q2_loss
-        kl_loss = self._kl_to_standard_normal(posterior_mean, posterior_log_variance)
-        inference_loss = critic_loss + self.kl_weight * kl_loss
+        kl_per_dimension = self._kl_per_dimension(posterior_mean, posterior_log_variance)
+        kl_loss = kl_per_dimension.sum()
+        penalized_kl = kl_per_dimension.clamp_min(self.kl_free_bits).sum()
+        if empty_context:
+            penalized_kl = torch.zeros((), device=self.device)
+        inference_loss = critic_loss + self.kl_weight * penalized_kl
         self.critic_optimizer.zero_grad()
         self.encoder_optimizer.zero_grad()
         inference_loss.backward()
@@ -218,16 +276,29 @@ class PEARLAgent:
         self.critic_optimizer.step()
         self.encoder_optimizer.step()
         self._update_targets()
-        return {
+        metrics = {
             "loss/critic": critic_loss.item(),
-            "loss/kl": kl_loss.item(),
             "stats/critic_gradient_norm": float(critic_gradient_norm),
-            "stats/encoder_gradient_norm": float(encoder_gradient_norm),
             "stats/target_q": target_q.mean().item(),
-            "stats/z_mean": posterior_mean.mean().item(),
-            "stats/z_std": torch.exp(0.5 * posterior_log_variance).mean().item(),
             "stats/meta_batch_tasks": float(tasks),
+            "stats/context_length": float(context.shape[1]),
         }
+        if not empty_context:
+            # Posterior statistics are only meaningful with context; logging
+            # the k = 0 prior would mask whether inference is working.
+            metrics.update(
+                {
+                    "loss/kl": kl_loss.item(),
+                    "loss/kl_penalized": penalized_kl.item(),
+                    "stats/encoder_gradient_norm": float(encoder_gradient_norm),
+                    "stats/z_mean": posterior_mean.mean().item(),
+                    "stats/z_std": torch.exp(0.5 * posterior_log_variance).mean().item(),
+                    # Spread of posterior means across tasks: near zero means
+                    # every task maps to the same latent.
+                    "stats/z_mean_task_std": posterior_mean.std(dim=0).mean().item() if tasks > 1 else 0.0,
+                }
+            )
+        return metrics
 
     def update(
         self,
@@ -242,15 +313,19 @@ class PEARLAgent:
 
         # Recompute only to obtain a current, detached task posterior for SAC's actor update.
         with torch.no_grad():
-            actor_mean, actor_log_variance = self.encoder(context)
-            actor_task_latents = self._sample_latents(actor_mean, actor_log_variance)
+            if context.shape[1] == 0:
+                actor_task_latents = torch.zeros((tasks, self.latent_dim), device=self.device)
+            else:
+                actor_mean, actor_log_variance = self.encoder(context)
+                actor_task_latents = self._sample_latents(actor_mean, actor_log_variance)
             actor_latents = self._expand_latents(actor_task_latents, transitions)
         sampled_actions, log_prob = self.actor(observations, actor_latents)
         q_value = torch.minimum(
             self.q1(observations, sampled_actions, actor_latents), self.q2(observations, sampled_actions, actor_latents)
         )
-        q_scale = q_value.detach().abs().mean().clamp_min(1.0)
-        sac_actor_loss = (self.alpha.detach() * log_prob - q_value / q_scale).mean()
+        sac_actor_loss, q_scale = self._normalized_sac_actor_loss(self.alpha.detach(), log_prob, q_value)
+        with torch.no_grad():
+            _, policy_log_std = self.actor.distribution_parameters(observations, actor_latents)
         bc_loss = torch.zeros((), device=self.device)
         if demonstration_batch is not None and bc_weight > 0:
             demo_observations = self._flatten(demonstration_batch.rl.observations)
@@ -284,6 +359,10 @@ class PEARLAgent:
             "stats/alpha": self.alpha.item(),
             "stats/q_value": q_value.mean().item(),
             "stats/q_scale": q_scale.item(),
+            # Squashed-policy entropy estimate; -action_dim * log(2) would be
+            # uniform random actions on [-1, 1]^action_dim.
+            "stats/policy_entropy": -log_prob.mean().item(),
+            "stats/policy_log_std": policy_log_std.mean().item(),
             "stats/actor_gradient_norm": float(actor_gradient_norm),
             "stats/meta_batch_tasks": float(tasks),
         }
@@ -311,12 +390,25 @@ class PEARLAgent:
         return action_loss + self.bc_log_std_weight * spread_loss, action_loss, spread_loss
 
     @staticmethod
+    def _normalized_sac_actor_loss(alpha: Tensor, log_prob: Tensor, q_value: Tensor) -> tuple[Tensor, Tensor]:
+        """SAC actor objective divided by the batch Q magnitude.
+
+        The division keeps the behavior-cloning term comparable in size to the
+        RL term. It must scale the entropy term too: normalizing only Q makes
+        the effective temperature ``alpha * q_scale``, which drove earlier runs
+        to near-uniform random actions.
+        """
+        q_scale = q_value.detach().abs().mean().clamp_min(1.0)
+        return ((alpha * log_prob - q_value) / q_scale).mean(), q_scale
+
+    @staticmethod
     def _sample_latents(mean: Tensor, log_variance: Tensor) -> Tensor:
         return mean + torch.exp(0.5 * log_variance) * torch.randn_like(mean)
 
     @staticmethod
-    def _kl_to_standard_normal(mean: Tensor, log_variance: Tensor) -> Tensor:
-        return (-0.5 * (1 + log_variance - mean.square() - log_variance.exp()).sum(dim=-1)).mean()
+    def _kl_per_dimension(mean: Tensor, log_variance: Tensor) -> Tensor:
+        """KL(q || N(0, I)) per latent dimension, averaged over tasks."""
+        return (-0.5 * (1 + log_variance - mean.square() - log_variance.exp())).mean(dim=0)
 
     def _flatten(self, values: np.ndarray) -> Tensor:
         return self._tensor(values).reshape(-1, values.shape[-1])

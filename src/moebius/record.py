@@ -10,7 +10,9 @@ import torch
 
 from moebius.envs import DynamicsTaskSampler, GoalTaskSampler, MetaWorldSingleTaskEnv, TaskSpec
 from moebius.networks import SquashedGaussianActor
-from moebius.pearl import PEARLAgent, context_transition
+from moebius.context import ContextBuilder, episode_batch
+from moebius.pearl import PEARLAgent
+from moebius.replay_buffer import Batch
 
 
 def parse_args() -> argparse.Namespace:
@@ -72,9 +74,13 @@ def load_pearl_agent(checkpoint: dict[str, Any], environment: MetaWorldSingleTas
         latent_dim=int(config["latent_dim"]),
         hidden_dim=int(config["hidden_dim"]),
         reward_scale=float(config.get("pearl_reward_scale", 1.0)),
-        fixed_alpha=float(config.get("pearl_fixed_alpha", 0.1)),
+        # log_alpha is restored from the checkpoint below; this only selects
+        # whether the temperature is fixed or tunable.
+        fixed_alpha=None if config.get("pearl_fixed_alpha") is None else float(config["pearl_fixed_alpha"]),
         gradient_clip_norm=float(config.get("gradient_clip_norm", 10.0)),
         min_posterior_std=float(config.get("min_posterior_std", 0.05)),
+        kl_weight=float(config.get("kl_weight", 0.05)),
+        kl_free_bits=float(config.get("kl_free_bits", 0.1)),
         device=device,
     )
     state = checkpoint["agent"]
@@ -90,12 +96,6 @@ def select_action(actor: SquashedGaussianActor, observation: np.ndarray, device:
     observation_tensor = torch.as_tensor(observation, dtype=torch.float32, device=device).unsqueeze(0)
     action, _ = actor(observation_tensor, deterministic=True)
     return action.squeeze(0).cpu().numpy()
-
-
-def _append_context(context: list[np.ndarray], transition: np.ndarray, context_size: int) -> None:
-    context.append(transition)
-    if len(context) > context_size:
-        del context[:-context_size]
 
 
 def _reset_task(environment: MetaWorldSingleTaskEnv, task: TaskSpec) -> np.ndarray:
@@ -136,16 +136,21 @@ def record_pearl_episode(
     agent: PEARLAgent,
     environment: MetaWorldSingleTaskEnv,
     task: TaskSpec,
-    context: list[np.ndarray],
-    context_size: int,
+    previous_episodes: list[Batch],
+    builder: ContextBuilder,
+    rng: np.random.Generator,
     video_path: Path,
     fps: int,
     deterministic: bool,
 ) -> tuple[float, bool]:
-    """Record one context-collection or adapted PEARL rollout on one task."""
+    """Record one context-collection or adapted PEARL rollout on one task.
+
+    The latent comes from the same rule used in training and evaluation, and
+    the finished episode is appended to ``previous_episodes``.
+    """
     observation = _reset_task(environment, task)
-    initial_context = np.asarray(context, dtype=np.float32) if context else None
-    episode_latent = agent.infer_latent(initial_context, deterministic=deterministic)
+    episode_latent, _ = agent.latent_for_episode(previous_episodes, builder, rng, deterministic=deterministic)
+    transitions = []
     episode_return = 0.0
     terminated = truncated = False
     info: dict[str, Any] = {}
@@ -154,14 +159,11 @@ def record_pearl_episode(
         while not (terminated or truncated):
             action = agent.act(observation, deterministic=deterministic, latent=episode_latent)
             next_observation, reward, terminated, truncated, info = environment.step(action)
-            _append_context(
-                context,
-                context_transition(observation, action, reward, next_observation, agent.reward_scale),
-                context_size,
-            )
+            transitions.append((observation, action, reward, next_observation, terminated))
             observation = next_observation
             episode_return += reward
             _append_frame(writer, environment)
+    previous_episodes.append(episode_batch(*zip(*transitions, strict=True)))
     return episode_return, bool(info.get("success", False))
 
 
@@ -209,19 +211,24 @@ def record_pearl(
         raise ValueError("--adaptation-episodes must be non-negative.")
 
     task = test_tasks[args.task_index]
-    context: list[np.ndarray] = []
-    context_size = int(config["context_size"])
+    previous_episodes: list[Batch] = []
+    builder = ContextBuilder(
+        context_size=int(config["context_size"]),
+        motion_fraction=float(config.get("context_motion_fraction", 0.75)),
+        motion_threshold=float(config.get("context_motion_threshold", 1e-3)),
+    )
+    rng = np.random.default_rng(int(config["seed"]) + 60_000)
     name_prefix = f"{config['env_name']}_pearl_task{args.task_index}"
     for episode in range(adaptation_episodes):
         video_path = args.video_dir / f"{name_prefix}_context_{episode + 1}.mp4"
         episode_return, success = record_pearl_episode(
-            agent, environment, task, context, context_size, video_path, args.fps, deterministic=False
+            agent, environment, task, previous_episodes, builder, rng, video_path, args.fps, deterministic=False
         )
         print(f"saved {video_path} (context={episode + 1}, return={episode_return:.1f}, success={success})")
 
     video_path = args.video_dir / f"{name_prefix}_adapted.mp4"
     episode_return, success = record_pearl_episode(
-        agent, environment, task, context, context_size, video_path, args.fps, deterministic=True
+        agent, environment, task, previous_episodes, builder, rng, video_path, args.fps, deterministic=True
     )
     print(f"saved {video_path} (adapted, return={episode_return:.1f}, success={success})")
 

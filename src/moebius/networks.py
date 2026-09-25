@@ -4,6 +4,7 @@ import math
 
 import torch
 from torch import Tensor, nn
+from torch.nn import functional as F
 from torch.distributions import Normal
 
 
@@ -89,7 +90,15 @@ class ContextEncoder(nn.Module):
     unit-normal prior using a product of diagonal Gaussians, which is invariant
     to the order of the context transitions and gives the prior for empty
     context.
+
+    Per-transition variances use ``softplus`` rather than a clamped
+    log-variance. A hard clamp has zero gradient once saturated: earlier runs
+    pinned every factor at the clamp ceiling, the posterior sat on the prior
+    and the encoder could not recover. The posterior floor is additive for the
+    same reason.
     """
+
+    _MIN_FACTOR_VARIANCE = 1e-4
 
     def __init__(self, context_dim: int, latent_dim: int, hidden_dim: int, min_posterior_std: float = 0.05) -> None:
         super().__init__()
@@ -100,17 +109,20 @@ class ContextEncoder(nn.Module):
         self.network = mlp(context_dim, 2 * latent_dim, hidden_dim)
 
     def forward(self, context: Tensor) -> tuple[Tensor, Tensor]:
-        """Return posterior mean and log variance for ``[tasks, context, features]``."""
+        """Return posterior mean and log variance for ``[tasks, context, features]``.
+
+        A zero-length context returns the prior ``N(0, I)`` (plus the floor).
+        """
         if context.ndim != 3:
             raise ValueError("Context must have shape [num_tasks, context_size, context_dim].")
         parameters = self.network(context)
-        means, log_variances = parameters.chunk(2, dim=-1)
-        log_variances = log_variances.clamp(-10, 5)
-        precisions = torch.exp(-log_variances)
+        means, raw_variances = parameters.chunk(2, dim=-1)
+        variances = F.softplus(raw_variances) + self._MIN_FACTOR_VARIANCE
+        precisions = variances.reciprocal()
 
         # Include p(z) = N(0, I) as one additional Gaussian factor.
         posterior_precision = 1 + precisions.sum(dim=1)
         posterior_variance = posterior_precision.reciprocal()
         posterior_mean = posterior_variance * (precisions * means).sum(dim=1)
-        posterior_variance = posterior_variance.clamp_min(self.min_posterior_variance)
+        posterior_variance = posterior_variance + self.min_posterior_variance
         return posterior_mean, posterior_variance.log()

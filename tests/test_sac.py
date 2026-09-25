@@ -6,10 +6,12 @@ from moebius.envs import DynamicsTaskSampler, GoalTaskSampler
 from moebius.networks import ContextEncoder
 from moebius.pearl import PEARLAgent, context_from_batch, context_transition
 from moebius.networks import SquashedGaussianActor
+from moebius.context import AdaptationContextBuffer, ContextBuilder, episode_batch
 from moebius.replay_buffer import (
+    Batch,
     MultiTaskReplayBuffer,
     ReplayBuffer,
-    TaskTrajectoryContextBuffer,
+    TaskBatch,
     concatenate_batches,
     concatenate_task_batch_rl,
 )
@@ -106,47 +108,70 @@ def test_dynamics_task_resampling_preserves_task_id_and_bounds() -> None:
     assert replacement.contact_softness is not None
 
 
-def test_task_context_buffer_preserves_chronological_prefixes() -> None:
-    contexts = TaskTrajectoryContextBuffer((0, 1), max_episodes_per_task=2, seed=3)
+def _episode(start: float, steps: int, observation_dim: int = 8, moving: bool = False) -> Batch:
+    """A synthetic episode; the object (obs[4:7]) moves 1 cm per step if ``moving``."""
+    observations = np.zeros((steps, observation_dim), dtype=np.float32)
+    observations[:, 0] = start + np.arange(steps)
+    next_observations = observations.copy()
+    if moving:
+        next_observations[:, 4] += 0.01
+    return episode_batch(
+        list(observations),
+        list(np.zeros((steps, 2), dtype=np.float32)),
+        [1.0] * steps,
+        list(next_observations),
+        [False] * steps,
+    )
+
+
+def test_context_builder_samples_distinct_transitions_and_prefers_object_motion() -> None:
+    builder = ContextBuilder(context_size=10, motion_fraction=0.8, motion_threshold=1e-3)
+    still, moving = _episode(0.0, 50), _episode(100.0, 50, moving=True)
+
+    context = builder.build([still, moving], np.random.default_rng(0))
+
+    assert context.observations.shape == (10, 8)
+    assert len(np.unique(context.observations[:, 0])) == 10
+    assert builder.motion_fraction_of(context) == 0.8
+    # A pool smaller than the context size is used whole, without duplicates.
+    short = builder.build([_episode(0.0, 4)], np.random.default_rng(0))
+    assert sorted(short.observations[:, 0]) == [0.0, 1.0, 2.0, 3.0]
+
+
+def test_adaptation_context_buffer_matches_deployment_history() -> None:
+    """Context for k previous episodes only uses the first k episodes of a sequence."""
+    builder = ContextBuilder(context_size=6, motion_fraction=0.0)
+    contexts = AdaptationContextBuffer((0, 1), observation_dim=8, action_dim=2, max_sequences_per_task=2, seed=3)
     for task_id in (0, 1):
-        contexts.begin_episode(task_id)
-        for step in range(10):
-            observation = np.array([float(step), float(task_id)], dtype=np.float32)
-            contexts.add(task_id, observation, np.array([step], dtype=np.float32), float(step), observation + 1, False)
-        contexts.end_episode(task_id)
+        contexts.begin_sequence(task_id)
+        for episode_index in range(3):
+            contexts.begin_episode(task_id)
+            for step in range(5):
+                observation = np.zeros(8, dtype=np.float32)
+                observation[0] = 100 * episode_index + step
+                contexts.add(task_id, observation, np.zeros(2), 1.0, observation, False)
+            contexts.end_episode(task_id)
+    assert contexts.max_previous_episodes(0) == 3
 
-    batch = contexts.sample_prefixes(np.array([0, 1]), max_context_size=8)
+    seen_lengths = set()
+    for _ in range(40):
+        batch, previous_episodes = contexts.sample(np.array([0, 1]), builder, max_previous_episodes=2)
+        seen_lengths.add(previous_episodes)
+        assert batch.observations.shape[:2] == (2, 0 if previous_episodes == 0 else 5 if previous_episodes == 1 else 6)
+        if previous_episodes:
+            # Episode index = obs[0] // 100 must be below k.
+            assert np.all(batch.observations[..., 0] // 100 < previous_episodes)
+    assert seen_lengths == {0, 1, 2}
 
-    assert batch.observations.shape[0] == 2
-    assert batch.observations.shape[1] in (1, 4, 8)
-    assert np.all(np.diff(batch.observations[:, :, 0], axis=1) == 1)
 
-
-def test_failed_expert_trajectory_can_be_discarded_before_buffer_commit() -> None:
-    """Demonstration collection must not add a trajectory until it is accepted."""
-    replay = MultiTaskReplayBuffer((0,), observation_dim=2, action_dim=1, capacity=8)
-    contexts = TaskTrajectoryContextBuffer((0,), max_episodes_per_task=2, seed=2)
-    failed_trajectory = [
-        (np.array([0.0, 0.0]), np.array([0.0]), 1.0, np.array([1.0, 0.0]), False),
-        (np.array([1.0, 0.0]), np.array([0.0]), 1.0, np.array([2.0, 0.0]), False),
-    ]
-    successful_trajectory = [
-        (np.array([3.0, 0.0]), np.array([0.0]), 1.0, np.array([4.0, 0.0]), False),
-        (np.array([4.0, 0.0]), np.array([0.0]), 1.0, np.array([5.0, 0.0]), True),
-    ]
-
-    # This mirrors a failed collection attempt: it is intentionally never committed.
-    assert replay.size(0) == 0
+def test_unfinished_episode_is_not_used_as_context() -> None:
+    contexts = AdaptationContextBuffer((0,), observation_dim=8, action_dim=2, seed=2)
+    contexts.begin_sequence(0)
     contexts.begin_episode(0)
-    for transition in successful_trajectory:
-        replay.add(0, *transition)
-        contexts.add(0, *transition)
-    contexts.end_episode(0)
-
-    assert len(failed_trajectory) == 2
-    assert replay.size(0) == len(successful_trajectory)
-    batch = contexts.sample_prefixes(np.array([0]), max_context_size=2)
-    assert np.all(batch.observations[:, :, 0] >= 3.0)
+    contexts.add(0, np.zeros(8), np.zeros(2), 1.0, np.zeros(8), False)
+    assert contexts.max_previous_episodes(0) == 0
+    batch, previous_episodes = contexts.sample(np.array([0]), ContextBuilder(context_size=4), max_previous_episodes=3)
+    assert previous_episodes == 0 and batch.observations.shape == (1, 0, 8)
 
 
 def test_sac_update_produces_finite_metrics() -> None:
@@ -246,7 +271,9 @@ def test_demonstration_augmented_pearl_updates() -> None:
     online_batch = online.sample_meta_batch(meta_batch_size=2, batch_size=8, context_size=6)
     demo_batch = demonstrations.sample_meta_batch_for_task_ids(online_batch.task_ids, batch_size=4, context_size=6)
     mixed_batch = concatenate_task_batch_rl(online_batch, demo_batch)
-    agent = PEARLAgent(observation_dim, np.full(action_dim, -1.0), np.full(action_dim, 1.0), latent_dim=4, hidden_dim=16)
+    agent = PEARLAgent(
+        observation_dim, np.full(action_dim, -1.0), np.full(action_dim, 1.0), latent_dim=4, hidden_dim=16, fixed_alpha=0.1
+    )
     initial_alpha = agent.alpha.item()
 
     pretrain_metrics = agent.behavior_clone(demo_batch)
@@ -262,3 +289,104 @@ def test_demonstration_augmented_pearl_updates() -> None:
     assert metrics["stats/q_scale"] >= 1
     assert agent.alpha.item() == initial_alpha
     assert pearl_online_bc_weight(TrainConfig(bc_weight=1.0, bc_decay_steps=100, pearl_bc_weight_floor=0.1), 100) == 0.1
+
+
+def test_pearl_actor_normalization_scales_entropy_with_q() -> None:
+    """Dividing only Q by q_scale would inflate the effective temperature."""
+    alpha = torch.tensor(0.1)
+    log_prob = torch.full((4, 1), -1.0, requires_grad=True)
+    q_value = torch.full((4, 1), 50.0, requires_grad=True)
+
+    loss, q_scale = PEARLAgent._normalized_sac_actor_loss(alpha, log_prob, q_value)
+    loss.backward()
+
+    assert q_scale.item() == 50.0
+    # Entropy and Q gradients keep SAC's alpha : 1 ratio after normalization.
+    assert torch.allclose(log_prob.grad, torch.full_like(log_prob, 0.1 / 50.0 / 4))
+    assert torch.allclose(q_value.grad, torch.full_like(q_value, -1.0 / 50.0 / 4))
+    assert torch.allclose(log_prob.grad / -q_value.grad, alpha.expand_as(log_prob))
+
+
+def test_pearl_tunes_alpha_automatically_by_default() -> None:
+    observation_dim, action_dim = 3, 2
+    buffer = MultiTaskReplayBuffer(range(2), observation_dim, action_dim, capacity=32)
+    for task_id in range(2):
+        for _ in range(32):
+            buffer.add(
+                task_id,
+                np.random.randn(observation_dim),
+                np.random.uniform(-1, 1, action_dim),
+                float(np.random.randn()),
+                np.random.randn(observation_dim),
+                False,
+            )
+    agent = PEARLAgent(observation_dim, np.full(action_dim, -1.0), np.full(action_dim, 1.0), latent_dim=4, hidden_dim=16)
+    assert agent.alpha_optimizer is not None
+    assert np.isclose(agent.alpha.item(), TrainConfig().pearl_initial_alpha)
+
+    initial_alpha = agent.alpha.item()
+    metrics = agent.update(buffer.sample_meta_batch(meta_batch_size=2, batch_size=8, context_size=6))
+
+    assert all(np.isfinite(value) for value in metrics.values())
+    assert "stats/policy_entropy" in metrics and "stats/policy_log_std" in metrics
+    assert agent.alpha.item() != initial_alpha
+
+
+def test_context_encoder_has_gradient_when_factors_are_very_uncertain() -> None:
+    """The old clamp(-10, 5) gave zero gradient here, freezing the posterior at the prior."""
+    encoder = ContextEncoder(context_dim=5, latent_dim=2, hidden_dim=8)
+    with torch.no_grad():
+        encoder.network[-1].bias[2:] = 100.0
+
+    mean, log_variance = encoder(torch.randn(3, 16, 5))
+    (mean.sum() + log_variance.sum()).backward()
+
+    assert torch.exp(0.5 * log_variance).mean() > 0.9
+    assert encoder.network[-1].bias.grad[2:].abs().sum() > 0
+
+
+def test_context_encoder_empty_context_returns_prior() -> None:
+    encoder = ContextEncoder(context_dim=5, latent_dim=3, hidden_dim=8, min_posterior_std=0.05)
+    mean, log_variance = encoder(torch.zeros(2, 0, 5))
+    assert torch.allclose(mean, torch.zeros_like(mean))
+    assert torch.allclose(log_variance.exp(), torch.full_like(log_variance, 1 + 0.05**2))
+
+
+def test_pearl_update_with_empty_context_uses_zero_latent_and_skips_kl() -> None:
+    observation_dim, action_dim = 8, 2
+    buffer = MultiTaskReplayBuffer(range(2), observation_dim, action_dim, capacity=32)
+    for task_id in range(2):
+        for _ in range(32):
+            buffer.add(task_id, np.random.randn(observation_dim), np.random.uniform(-1, 1, action_dim), 1.0, np.random.randn(observation_dim), False)
+    contexts = AdaptationContextBuffer(range(2), observation_dim, action_dim, seed=0)
+    task_batch = buffer.sample_meta_batch(meta_batch_size=2, batch_size=8, context_size=1)
+    context, previous_episodes = contexts.sample(task_batch.task_ids, ContextBuilder(context_size=4), 3)
+    assert previous_episodes == 0
+    empty_batch = TaskBatch(task_ids=task_batch.task_ids, context=context, rl=task_batch.rl)
+    agent = PEARLAgent(observation_dim, np.full(action_dim, -1.0), np.full(action_dim, 1.0), latent_dim=3, hidden_dim=16)
+
+    metrics = agent.update(empty_batch)
+    bc_metrics = agent.behavior_clone(empty_batch)
+
+    assert all(np.isfinite(value) for value in metrics.values())
+    assert all(np.isfinite(value) for value in bc_metrics.values())
+    assert "loss/kl" not in metrics and metrics["stats/context_length"] == 0
+
+
+def test_kl_free_bits_leave_small_posteriors_unpenalized() -> None:
+    per_dimension = PEARLAgent._kl_per_dimension(torch.tensor([[0.1, 2.0]]), torch.zeros(1, 2))
+    assert torch.allclose(per_dimension, torch.tensor([0.005, 2.0]))
+    assert torch.isclose(per_dimension.clamp_min(0.1).sum(), torch.tensor(2.1))
+
+
+def test_latent_for_episode_uses_prior_first_then_context() -> None:
+    agent = PEARLAgent(8, np.full(2, -1.0), np.full(2, 1.0), latent_dim=3, hidden_dim=16)
+    builder = ContextBuilder(context_size=5)
+    rng = np.random.default_rng(0)
+
+    first_latent, first_context = agent.latent_for_episode([], builder, rng)
+    later_latent, later_context = agent.latent_for_episode([_episode(0.0, 20)], builder, rng, deterministic=True)
+
+    assert first_context is None and np.all(first_latent == 0)
+    assert later_context is not None and later_context.observations.shape == (5, 8)
+    assert later_latent.shape == (3,)

@@ -10,13 +10,14 @@ import torch
 from torch.utils.tensorboard import SummaryWriter
 
 from moebius.config import TrainConfig
+from moebius.context import AdaptationContextBuffer, ContextBuilder, episode_batch
 from moebius.envs import DynamicsTaskSampler, GoalTaskSampler, MetaWorldSingleTaskEnv, TaskSpec
-from moebius.pearl import PEARLAgent, context_transition
+from moebius.pearl import PEARLAgent, context_from_batch
 from moebius.replay_buffer import (
+    Batch,
     MultiTaskReplayBuffer,
     ReplayBuffer,
     TaskBatch,
-    TaskTrajectoryContextBuffer,
     concatenate_batches,
     concatenate_task_batch_rl,
 )
@@ -117,24 +118,48 @@ def parse_args() -> TrainConfig:
     parser.add_argument(
         "--pearl-fixed-alpha",
         type=float,
-        default=0.1,
-        help="Fixed PEARL entropy coefficient; prevents automatic-temperature runaway.",
+        default=None,
+        help="Fixed PEARL entropy coefficient in scaled-reward units. Omit to tune it automatically toward the target entropy.",
+    )
+    parser.add_argument(
+        "--pearl-initial-alpha",
+        type=float,
+        default=0.02,
+        help="Starting PEARL entropy coefficient (scaled-reward units) when it is tuned automatically.",
     )
     parser.add_argument("--gradient-clip-norm", type=float, default=10.0)
     parser.add_argument("--min-posterior-std", type=float, default=0.05)
     parser.add_argument(
-        "--context-episodes-per-task",
+        "--context-sequences-per-task",
         type=int,
-        default=64,
-        help="Completed chronological context episodes retained per PEARL task.",
+        default=4,
+        help="Recent adaptation sequences kept per PEARL task for sampling encoder context.",
+    )
+    parser.add_argument(
+        "--context-motion-fraction",
+        type=float,
+        default=0.75,
+        help="Target share of context transitions in which the object moved.",
+    )
+    parser.add_argument(
+        "--context-motion-threshold",
+        type=float,
+        default=1e-3,
+        help="Per-step object displacement (m) that counts as the object moving.",
     )
     parser.add_argument("--latent-dim", type=int, default=5)
     parser.add_argument("--encoder-lr", type=float, default=3e-4)
-    parser.add_argument("--kl-weight", type=float, default=0.1)
+    parser.add_argument("--kl-weight", type=float, default=0.05)
+    parser.add_argument(
+        "--kl-free-bits",
+        type=float,
+        default=0.1,
+        help="KL nats per latent dimension that are not penalized.",
+    )
     parser.add_argument("--num-train-tasks", type=int, default=20)
     parser.add_argument("--num-eval-tasks", type=int, default=10)
     parser.add_argument("--meta-batch-size", type=int, default=8)
-    parser.add_argument("--context-size", type=int, default=32)
+    parser.add_argument("--context-size", type=int, default=64)
     parser.add_argument("--adaptation-episodes", type=int, default=3)
     args = parser.parse_args()
     return TrainConfig(**vars(args))
@@ -380,7 +405,7 @@ Trajectory = list[tuple[np.ndarray, np.ndarray, float, np.ndarray, bool]]
 class FeasibleDynamicsData:
     sampler: DynamicsTaskSampler
     demonstrations: MultiTaskReplayBuffer | None
-    contexts: TaskTrajectoryContextBuffer | None
+    contexts: AdaptationContextBuffer | None
 
 
 def collect_feasible_dynamics_data(
@@ -415,8 +440,14 @@ def collect_feasible_dynamics_data(
         required_successes * config.max_episode_steps,
         config.seed + 20_000,
     )
-    contexts = TaskTrajectoryContextBuffer(
-        (task.task_id for task in sampler.train_tasks), config.context_episodes_per_task, config.seed + 30_000
+    # Every demonstration sequence is stored in each rotation, so sampling
+    # k previous episodes does not always use the same first k demos.
+    contexts = AdaptationContextBuffer(
+        (task.task_id for task in sampler.train_tasks),
+        observation_dim,
+        action_dim,
+        max_sequences_per_task=required_successes,
+        seed=config.seed + 30_000,
     )
     environment = MetaWorldSingleTaskEnv(config.env_name, config.seed + 3, config.max_episode_steps)
     expert = _pick_place_expert()
@@ -460,12 +491,13 @@ def collect_feasible_dynamics_data(
                         f"({required_successes}/{attempts} expert successes)"
                     )
                     if retain:
+                        episodes = []
                         for trajectory in trajectories:
-                            contexts.begin_episode(candidate.task_id)
                             for transition in trajectory:
                                 demonstrations.add(candidate.task_id, *transition)
-                                contexts.add(candidate.task_id, *transition)
-                            contexts.end_episode(candidate.task_id)
+                            episodes.append(episode_batch(*zip(*trajectory, strict=True)))
+                        for offset in range(len(episodes)):
+                            contexts.add_sequence(candidate.task_id, episodes[offset:] + episodes[:offset])
                     writer.add_scalar(f"demo/{split}_task_{candidate.task_id}_attempts", attempts, 0)
                     break
                 candidate = sampler.resample_task(original_task.task_id)
@@ -488,13 +520,26 @@ def collect_feasible_dynamics_data(
 
 
 def contextualize_task_batch(
-    task_batch: TaskBatch, contexts: TaskTrajectoryContextBuffer, context_size: int
-) -> TaskBatch:
-    """Replace replay's unordered context with a rollout-like prefix context."""
-    return TaskBatch(
-        task_ids=task_batch.task_ids,
-        context=contexts.sample_prefixes(task_batch.task_ids, context_size),
-        rl=task_batch.rl,
+    task_batch: TaskBatch,
+    contexts: AdaptationContextBuffer,
+    builder: ContextBuilder,
+    max_previous_episodes: int,
+) -> tuple[TaskBatch, int]:
+    """Replace replay's random context with a deployment-shaped context.
+
+    The context for each task is built from ``k`` complete earlier episodes of
+    one stored adaptation sequence, exactly as before adaptation episode ``k``
+    at deployment. ``k = 0`` gives an empty context and ``z = 0``.
+    """
+    context, previous_episodes = contexts.sample(task_batch.task_ids, builder, max_previous_episodes)
+    return TaskBatch(task_ids=task_batch.task_ids, context=context, rl=task_batch.rl), previous_episodes
+
+
+def context_builder(config: TrainConfig) -> ContextBuilder:
+    return ContextBuilder(
+        context_size=config.context_size,
+        motion_fraction=config.context_motion_fraction,
+        motion_threshold=config.context_motion_threshold,
     )
 
 
@@ -507,42 +552,56 @@ def pearl_online_bc_weight(config: TrainConfig, step: int) -> float:
     return max(config.pearl_bc_weight_floor, decayed)
 
 
-def _append_context(context: list[np.ndarray], transition: np.ndarray, context_size: int) -> np.ndarray:
-    context.append(transition)
-    if len(context) > context_size:
-        del context[:-context_size]
-    return np.asarray(context, dtype=np.float32)
+@dataclass
+class PearlEpisodeResult:
+    episode_return: float
+    success: float
+    episode: Batch
+    context: Batch | None
+    posterior_std: float
 
 
 def _pearl_episode(
     agent: PEARLAgent,
     environment: MetaWorldSingleTaskEnv,
     task: TaskSpec,
-    context: list[np.ndarray],
-    context_size: int,
+    previous_episodes: list[Batch],
+    builder: ContextBuilder,
+    rng: np.random.Generator,
     deterministic: bool,
-    buffer: MultiTaskReplayBuffer | None = None,
-) -> tuple[float, float]:
+) -> PearlEpisodeResult:
+    """Run one adaptation episode using the shared latent-selection rule."""
     observation = _reset_task(environment, task)
-    initial_context = np.asarray(context, dtype=np.float32) if context else None
-    episode_latent = agent.infer_latent(initial_context, deterministic=deterministic)
+    episode_latent, context = agent.latent_for_episode(previous_episodes, builder, rng, deterministic=deterministic)
+    posterior_std = 1.0
+    if context is not None:
+        _, std = agent.posterior(context_from_batch(context, agent.reward_scale))
+        posterior_std = float(std.mean())
     terminated = truncated = False
     episode_return = 0.0
     info: dict[str, float] = {}
+    transitions = []
     while not (terminated or truncated):
         action = agent.act(observation, deterministic=deterministic, latent=episode_latent)
         next_observation, reward, terminated, truncated, info = environment.step(action)
-        if buffer is not None:
-            # As in SAC, time-limit truncation should still bootstrap.
-            buffer.add(task.task_id, observation, action, reward, next_observation, terminated)
-        _append_context(
-            context,
-            context_transition(observation, action, reward, next_observation, agent.reward_scale),
-            context_size,
-        )
+        transitions.append((observation, action, reward, next_observation, terminated))
         observation = next_observation
         episode_return += reward
-    return episode_return, float(info.get("success", False))
+    return PearlEpisodeResult(
+        episode_return,
+        float(info.get("success", False)),
+        episode_batch(*zip(*transitions, strict=True)),
+        context,
+        posterior_std,
+    )
+
+
+@dataclass
+class PearlEvaluation:
+    returns: np.ndarray
+    successes: np.ndarray
+    posterior_stds: np.ndarray
+    context_motion_fractions: np.ndarray
 
 
 def evaluate_pearl(
@@ -550,23 +609,30 @@ def evaluate_pearl(
     environment: MetaWorldSingleTaskEnv,
     tasks: tuple[TaskSpec, ...],
     adaptation_episodes: int,
-    context_size: int,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Measure return and success before/after accumulating adaptation context."""
-    returns = np.zeros(adaptation_episodes + 1, dtype=np.float64)
-    successes = np.zeros(adaptation_episodes + 1, dtype=np.float64)
+    builder: ContextBuilder,
+    rng: np.random.Generator,
+) -> PearlEvaluation:
+    """Measure return, success and posterior width as context accumulates."""
+    steps = adaptation_episodes + 1
+    returns, successes = np.zeros(steps), np.zeros(steps)
+    posterior_stds, motion_fractions = np.zeros(steps), np.zeros(steps)
     for task in tasks:
-        context: list[np.ndarray] = []
-        for adaptation_step in range(adaptation_episodes + 1):
-            # The first rollout is prior-only. Subsequent rollouts use context
-            # collected by previous exploratory episodes on the same task.
+        previous_episodes: list[Batch] = []
+        for adaptation_step in range(steps):
+            # The first rollout uses z = 0. Later rollouts use context built
+            # from all earlier episodes on the same task.
             deterministic = adaptation_step == adaptation_episodes
-            episode_return, success = _pearl_episode(
-                agent, environment, task, context, context_size, deterministic=deterministic
+            result = _pearl_episode(
+                agent, environment, task, previous_episodes, builder, rng, deterministic=deterministic
             )
-            returns[adaptation_step] += episode_return
-            successes[adaptation_step] += success
-    return returns / len(tasks), successes / len(tasks)
+            previous_episodes.append(result.episode)
+            returns[adaptation_step] += result.episode_return
+            successes[adaptation_step] += result.success
+            posterior_stds[adaptation_step] += result.posterior_std
+            if result.context is not None:
+                motion_fractions[adaptation_step] += builder.motion_fraction_of(result.context)
+    count = len(tasks)
+    return PearlEvaluation(returns / count, successes / count, posterior_stds / count, motion_fractions / count)
 
 
 def train_pearl(config: TrainConfig) -> None:
@@ -582,7 +648,7 @@ def train_pearl(config: TrainConfig) -> None:
     run_name = f"{config.env_name}_pearl_seed{config.seed}"
     writer = SummaryWriter(config.log_dir / run_name)
     writer.add_text("config", str(asdict(config)))
-    demonstration_data: tuple[MultiTaskReplayBuffer, TaskTrajectoryContextBuffer] | None = None
+    demonstration_data: tuple[MultiTaskReplayBuffer, AdaptationContextBuffer] | None = None
     if isinstance(task_sampler, DynamicsTaskSampler):
         feasible_data = collect_feasible_dynamics_data(config, task_sampler, observation_dim, action_dim, writer)
         task_sampler = feasible_data.sampler
@@ -601,9 +667,11 @@ def train_pearl(config: TrainConfig) -> None:
         encoder_lr=config.encoder_lr,
         alpha_lr=config.alpha_lr,
         kl_weight=config.kl_weight,
+        kl_free_bits=config.kl_free_bits,
         target_entropy=config.target_entropy,
         reward_scale=config.pearl_reward_scale,
         fixed_alpha=config.pearl_fixed_alpha,
+        initial_alpha=config.pearl_initial_alpha,
         gradient_clip_norm=config.gradient_clip_norm,
         min_posterior_std=config.min_posterior_std,
         device=device,
@@ -611,45 +679,61 @@ def train_pearl(config: TrainConfig) -> None:
     buffer = MultiTaskReplayBuffer(
         (task.task_id for task in task_sampler.train_tasks), observation_dim, action_dim, config.replay_size, config.seed
     )
-    online_contexts = TaskTrajectoryContextBuffer(
-        (task.task_id for task in task_sampler.train_tasks), config.context_episodes_per_task, config.seed + 40_000
+    online_contexts = AdaptationContextBuffer(
+        (task.task_id for task in task_sampler.train_tasks),
+        observation_dim,
+        action_dim,
+        max_sequences_per_task=config.context_sequences_per_task,
+        seed=config.seed + 40_000,
     )
+    builder = context_builder(config)
+    rollout_rng = np.random.default_rng(config.seed + 50_000)
+    evaluation_rng = np.random.default_rng(config.seed + 60_000)
     demonstrations: MultiTaskReplayBuffer | None = None
     if demonstration_data is not None:
         demonstrations, demonstration_contexts = demonstration_data
         if config.pearl_bc_pretrain_updates < 0:
             raise ValueError("--pearl-bc-pretrain-updates must be non-negative.")
         for update in range(1, config.pearl_bc_pretrain_updates + 1):
-            demonstration_batch = contextualize_task_batch(
-                demonstrations.sample_meta_batch(config.meta_batch_size, config.batch_size, config.context_size),
+            # k = 0 (empty context, z = 0) is sampled like any other k, which
+            # trains the first-episode policy used at deployment.
+            demonstration_batch, _ = contextualize_task_batch(
+                demonstrations.sample_meta_batch(config.meta_batch_size, config.batch_size, 1),
                 demonstration_contexts,
-                config.context_size,
+                builder,
+                config.adaptation_episodes,
             )
-            metrics = agent.behavior_clone(demonstration_batch, prior_context=update % 4 == 0)
+            metrics = agent.behavior_clone(demonstration_batch)
             if update % 100 == 0 or update == config.pearl_bc_pretrain_updates:
                 writer.add_scalar("pretrain/pearl_bc_loss", metrics["loss/bc"], update)
         if config.pearl_critic_pretrain_updates < 0:
             raise ValueError("--pearl-critic-pretrain-updates must be non-negative.")
         for update in range(1, config.pearl_critic_pretrain_updates + 1):
-            demonstration_batch = contextualize_task_batch(
-                demonstrations.sample_meta_batch(config.meta_batch_size, config.batch_size, config.context_size),
+            demonstration_batch, _ = contextualize_task_batch(
+                demonstrations.sample_meta_batch(config.meta_batch_size, config.batch_size, 1),
                 demonstration_contexts,
-                config.context_size,
+                builder,
+                config.adaptation_episodes,
             )
             # Keep the cloned actor synchronized with the encoder while the
             # value functions warm up on demonstration-only data.
             metrics = agent.update(demonstration_batch, demonstration_batch, bc_weight=config.bc_weight)
             if update % 100 == 0 or update == config.pearl_critic_pretrain_updates:
                 writer.add_scalar("pretrain/pearl_critic_loss", metrics["loss/critic"], update)
-                writer.add_scalar("pretrain/pearl_kl_loss", metrics["loss/kl"], update)
+                if "loss/kl" in metrics:
+                    writer.add_scalar("pretrain/pearl_kl_loss", metrics["loss/kl"], update)
                 writer.add_scalar("pretrain/pearl_joint_bc_loss", metrics["loss/bc"], update)
         online_batch_size, demo_batch_size = demonstration_batch_sizes(config.batch_size, config.demo_batch_fraction)
 
     task = task_sampler.sample_train_task()
     observation = _reset_task(environment, task)
+    online_contexts.begin_sequence(task.task_id)
     online_contexts.begin_episode(task.task_id)
-    task_context: list[np.ndarray] = []
-    episode_latent = agent.infer_latent(None)
+    # Completed episodes of the current adaptation sequence; the latent for
+    # each new episode is inferred from these, as at evaluation time.
+    sequence_episodes: list[Batch] = []
+    episode_transitions: list[tuple[np.ndarray, np.ndarray, float, np.ndarray, bool]] = []
+    episode_latent, _ = agent.latent_for_episode(sequence_episodes, builder, rollout_rng)
     episodes_on_task = 0
     episode_return, episode_length = 0.0, 0
     try:
@@ -662,49 +746,53 @@ def train_pearl(config: TrainConfig) -> None:
             done = terminated or truncated
             buffer.add(task.task_id, observation, action, reward, next_observation, terminated)
             online_contexts.add(task.task_id, observation, action, reward, next_observation, terminated)
-            _append_context(
-                task_context,
-                context_transition(observation, action, reward, next_observation, agent.reward_scale),
-                config.context_size,
-            )
+            episode_transitions.append((observation, action, reward, next_observation, terminated))
             observation = next_observation
             episode_return += reward
             episode_length += 1
 
             if done:
                 online_contexts.end_episode(task.task_id)
+                sequence_episodes.append(episode_batch(*zip(*episode_transitions, strict=True)))
+                episode_transitions = []
                 writer.add_scalar("train/episode_return", episode_return, step)
                 writer.add_scalar("train/episode_length", episode_length, step)
                 writer.add_scalar("train/success", float(info.get("success", False)), step)
                 episodes_on_task += 1
                 if episodes_on_task >= config.adaptation_episodes + 1:
                     task = task_sampler.sample_train_task()
-                    task_context = []
+                    sequence_episodes = []
                     episodes_on_task = 0
+                    online_contexts.begin_sequence(task.task_id)
                 observation = _reset_task(environment, task)
                 online_contexts.begin_episode(task.task_id)
-                current_context = np.asarray(task_context, dtype=np.float32) if task_context else None
-                episode_latent = agent.infer_latent(current_context)
+                episode_latent, rollout_context = agent.latent_for_episode(sequence_episodes, builder, rollout_rng)
+                if rollout_context is not None:
+                    writer.add_scalar(
+                        "train/context_motion_fraction", builder.motion_fraction_of(rollout_context), step
+                    )
                 episode_return, episode_length = 0.0, 0
 
             if step >= config.update_after and step % config.update_every == 0:
                 try:
                     for _ in range(config.update_every * config.updates_per_step):
                         if demonstrations is None:
-                            online_batch = contextualize_task_batch(
-                                buffer.sample_meta_batch(config.meta_batch_size, config.batch_size, config.context_size),
+                            online_batch, previous_episodes = contextualize_task_batch(
+                                buffer.sample_meta_batch(config.meta_batch_size, config.batch_size, 1),
                                 online_contexts,
-                                config.context_size,
+                                builder,
+                                config.adaptation_episodes,
                             )
                             metrics = agent.update(online_batch)
                         else:
-                            online_batch = contextualize_task_batch(
-                                buffer.sample_meta_batch(config.meta_batch_size, online_batch_size, config.context_size),
+                            online_batch, previous_episodes = contextualize_task_batch(
+                                buffer.sample_meta_batch(config.meta_batch_size, online_batch_size, 1),
                                 online_contexts,
-                                config.context_size,
+                                builder,
+                                config.adaptation_episodes,
                             )
                             demo_batch = demonstrations.sample_meta_batch_for_task_ids(
-                                online_batch.task_ids, demo_batch_size, config.context_size
+                                online_batch.task_ids, demo_batch_size, 1
                             )
                             metrics = agent.update(
                                 concatenate_task_batch_rl(online_batch, demo_batch),
@@ -717,22 +805,42 @@ def train_pearl(config: TrainConfig) -> None:
                 if metrics is not None:
                     for name, value in metrics.items():
                         writer.add_scalar(name, value, step)
+                    writer.add_scalar("stats/context_previous_episodes", previous_episodes, step)
+                    writer.add_scalar(
+                        "stats/context_motion_fraction", builder.motion_fraction_of(online_batch.context), step
+                    )
                     if demonstrations is not None:
                         writer.add_scalar("schedule/pearl_bc_weight", pearl_online_bc_weight(config, step), step)
 
             if step % config.eval_interval == 0:
-                evaluation_returns, evaluation_successes = evaluate_pearl(
+                evaluation = evaluate_pearl(
                     agent,
                     evaluation_environment,
                     task_sampler.test_tasks,
                     config.adaptation_episodes,
-                    config.context_size,
+                    builder,
+                    evaluation_rng,
                 )
-                for adaptation_step, (evaluation_return, evaluation_success) in enumerate(
-                    zip(evaluation_returns, evaluation_successes, strict=True)
-                ):
-                    writer.add_scalar(f"eval/return_after_context_{adaptation_step}", evaluation_return, step)
-                    writer.add_scalar(f"eval/success_after_context_{adaptation_step}", evaluation_success, step)
+                evaluation_successes = evaluation.successes
+                for adaptation_step in range(config.adaptation_episodes + 1):
+                    writer.add_scalar(
+                        f"eval/return_after_context_{adaptation_step}", evaluation.returns[adaptation_step], step
+                    )
+                    writer.add_scalar(
+                        f"eval/success_after_context_{adaptation_step}", evaluation.successes[adaptation_step], step
+                    )
+                    if adaptation_step > 0:
+                        # Should shrink as context accumulates if inference works.
+                        writer.add_scalar(
+                            f"eval/z_std_after_context_{adaptation_step}",
+                            evaluation.posterior_stds[adaptation_step],
+                            step,
+                        )
+                        writer.add_scalar(
+                            f"eval/context_motion_fraction_{adaptation_step}",
+                            evaluation.context_motion_fractions[adaptation_step],
+                            step,
+                        )
                 print(
                     f"step={step:,} prior_success={evaluation_successes[0]:.2%} "
                     f"adapted_success={evaluation_successes[-1]:.2%}"

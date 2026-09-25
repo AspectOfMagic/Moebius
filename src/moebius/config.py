@@ -62,17 +62,25 @@ class TrainConfig:
     pearl_critic_pretrain_updates: int = 5_000
     pearl_bc_weight_floor: float = 0.1
     pearl_reward_scale: float = 0.1
-    pearl_fixed_alpha: float = 0.1
+    # None enables SAC's automatic entropy tuning toward target_entropy.
+    # Both alpha values are in scaled-reward units (see pearl_reward_scale).
+    pearl_fixed_alpha: float | None = None
+    pearl_initial_alpha: float = 0.02
     gradient_clip_norm: float = 10.0
     min_posterior_std: float = 0.05
-    context_episodes_per_task: int = 64
+    # Encoder context: built from the completed episodes earlier in the same
+    # adaptation sequence, identically in training, evaluation and recording.
+    context_sequences_per_task: int = 4
+    context_motion_fraction: float = 0.75
+    context_motion_threshold: float = 1e-3
     latent_dim: int = 5
     encoder_lr: float = 3e-4
-    kl_weight: float = 0.01
+    kl_weight: float = 0.05
+    kl_free_bits: float = 0.1
     num_train_tasks: int = 20
     num_eval_tasks: int = 10
     meta_batch_size: int = 8
-    context_size: int = 32
+    context_size: int = 64
     adaptation_episodes: int = 3
     max_episode_steps: int = 500
     eval_interval: int = 10_000

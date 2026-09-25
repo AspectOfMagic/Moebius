@@ -55,21 +55,54 @@ Phase 4 introduces hidden object properties.
 - Object and goal positions are still randomized on every reset within each
   task. This ensures that PEARL must infer dynamics from transitions rather
   than using a visible configuration as a task label.
-- PEARL behavior-clones both its actor and context encoder using chronological
-  context windows of lengths 1, 4, 8, 16, or 32, plus explicit empty-context
-  (`z = 0`) training. It then uses the retained task-specific demonstrations
+- PEARL behavior-clones both its actor and context encoder on the same
+  context shapes used at deployment (see "Encoder context" below), including
+  the empty context (`z = 0`) of each task's first episode. It then uses the retained task-specific demonstrations
   in mixed online/offline updates with a cloning-loss floor instead of removing
   the expert anchor entirely.
 - PEARL now behavior-clones both the deterministic action and a conservative
   policy spread, then warms up its critics on demonstrations before online
   interaction. Online updates use scaled rewards, Huber critic losses,
-  gradient clipping, a fixed entropy coefficient, and a Q-normalized actor
-  objective so the cloning term cannot be overwhelmed by the critic scale.
+  gradient clipping, and a Q-normalized actor objective so the cloning term
+  cannot be overwhelmed by the critic scale. The normalization divides the
+  whole SAC objective (entropy and Q) by the batch Q magnitude, so the
+  entropy temperature keeps its usual meaning. The temperature is tuned
+  automatically toward the target entropy, starting from
+  `--pearl-initial-alpha` (0.02 in scaled-reward units); pass
+  `--pearl-fixed-alpha` to hold it constant instead. TensorBoard logs
+  `stats/policy_entropy` and `stats/policy_log_std`; an entropy near
+  `action_dim * log(2)` (about 2.77 for MetaWorld) means the policy is close
+  to uniform random actions.
 - One task latent is sampled and held fixed for each complete rollout. Tasks
   are collected in short adaptation sequences, matching evaluation instead
   of resampling a different latent at every environment step. A posterior
   standard-deviation floor prevents the context encoder from becoming
   arbitrarily overconfident.
+
+### Encoder context
+
+Training, evaluation and recording all choose an episode's latent with one
+rule (`PEARLAgent.latent_for_episode` and `moebius.context.ContextBuilder`):
+
+- The first episode on a task uses `z = 0`.
+- Before adaptation episode `k`, the context is pooled from all `k` completed
+  earlier episodes on that task, not just the tail of the last one.
+- Up to `--context-motion-fraction` (default 0.75) of the `--context-size`
+  (default 64) transitions are ones where the object moved more than
+  `--context-motion-threshold` (default 1 mm) in a step. Hidden mass,
+  friction and softness only show up while the object is being handled.
+  Motion is read from the observation, so nothing hidden is used.
+- Training samples `k` from 0 to `--adaptation-episodes` and builds each
+  task's context from the first `k` episodes of one of its
+  `--context-sequences-per-task` (default 4) most recent adaptation sequences,
+  so the encoder is trained on what it will see at deployment.
+
+The encoder turns each transition into a Gaussian factor whose variance uses
+`softplus` instead of a clamped log-variance. The clamp had zero gradient once
+saturated, which left earlier runs with a posterior equal to the prior. The KL
+penalty uses `--kl-weight` (default 0.05) with `--kl-free-bits` (default 0.1
+nats per latent dimension that are not penalized), so the posterior is not
+pushed all the way back to the prior.
 
 ## Setup
 
@@ -128,12 +161,12 @@ training tasks; held-out dynamics are never added to a buffer.
 ```bash
 moebius-train --algorithm pearl --pearl-task-distribution dynamics \
   --num-train-tasks 20 --num-eval-tasks 10 \
-  --latent-dim 5 --context-size 16 --meta-batch-size 8 \
+  --latent-dim 5 --context-size 64 --meta-batch-size 8 \
   --pearl-demo-episodes-per-task 5 --pearl-bc-pretrain-updates 5000 \
   --pearl-critic-pretrain-updates 5000 \
   --demo-batch-fraction 0.25 --bc-weight 1.0 --bc-decay-steps 500000 \
-  --pearl-bc-weight-floor 0.2 --context-episodes-per-task 64 \
-  --pearl-reward-scale 0.1 --pearl-fixed-alpha 0.1 \
+  --pearl-bc-weight-floor 0.2 --context-sequences-per-task 4 \
+  --pearl-reward-scale 0.1 --pearl-initial-alpha 0.02 \
   --total-steps 1000000
 ```
 
@@ -143,7 +176,7 @@ PEARL variant. TensorBoard logs `demo/pearl_*`, `pretrain/pearl_bc_loss`,
 target/Q scales, `loss/bc`, and `schedule/pearl_bc_weight` alongside adaptation
 success.
 
-The context buffers preserve episode order. During online fine-tuning, expert
+During online fine-tuning, expert
 actions are cloned under the learner's own sampled task latent, not a separate
 clean expert context. That latent remains fixed during a rollout and is
 updated between adaptation episodes, matching deployment.
@@ -178,6 +211,18 @@ For PEARL, inspect `loss/kl`, `stats/z_mean`, `stats/z_std`, and especially
 `eval/success_after_context_0`, `eval/success_after_context_1`, and so on. An
 improving held-out success curve as context episodes accumulate is the Phase 2
 adaptation signal.
+
+To check that task inference is alive:
+
+- `stats/z_std` should fall clearly below 1, and `eval/z_std_after_context_k`
+  should shrink as `k` grows.
+- `stats/z_mean_task_std` should be well above 0. Near 0 means every task gets
+  the same latent.
+- `loss/kl` should settle above the free-bits floor (0.5 nats with 5 latent
+  dimensions).
+- `stats/context_motion_fraction` and `eval/context_motion_fraction_k` show
+  how much of the context involves the object moving. Values near 0 mean the
+  policy rarely touches the object, so there is little to infer from.
 
 ## Record a trained policy
 
