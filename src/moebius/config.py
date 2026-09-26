@@ -66,6 +66,11 @@ class TrainConfig:
     # Both alpha values are in scaled-reward units (see pearl_reward_scale).
     pearl_fixed_alpha: float | None = None
     pearl_initial_alpha: float = 0.02
+    # Critic stabilization. pearl_max_reward is the largest per-step reward
+    # (MetaWorld: 10); TD targets are capped at the return it implies. Set 0
+    # to disable. LayerNorm in the critics limits value extrapolation.
+    pearl_max_reward: float = 10.0
+    pearl_critic_layer_norm: bool = True
     gradient_clip_norm: float = 10.0
     min_posterior_std: float = 0.05
     # Encoder context: built from the completed episodes earlier in the same

@@ -17,7 +17,7 @@ def test_load_pearl_agent_restores_encoder_and_latent_policy() -> None:
         hidden_dim=16,
     )
     checkpoint = {
-        "config": {"latent_dim": 4, "hidden_dim": 16},
+        "config": {"latent_dim": 4, "hidden_dim": 16, "pearl_critic_layer_norm": True},
         "agent": source.state_dict(),
     }
     environment = SimpleNamespace(

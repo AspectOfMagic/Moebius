@@ -81,6 +81,8 @@ def load_pearl_agent(checkpoint: dict[str, Any], environment: MetaWorldSingleTas
         min_posterior_std=float(config.get("min_posterior_std", 0.05)),
         kl_weight=float(config.get("kl_weight", 0.05)),
         kl_free_bits=float(config.get("kl_free_bits", 0.1)),
+        # Checkpoints from before this option have plain critics.
+        critic_layer_norm=bool(config.get("pearl_critic_layer_norm", False)),
         device=device,
     )
     state = checkpoint["agent"]

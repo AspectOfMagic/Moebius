@@ -74,6 +74,8 @@ class PEARLAgent:
         initial_alpha: float = 0.02,
         gradient_clip_norm: float = 10.0,
         min_posterior_std: float = 0.05,
+        max_reward: float | None = 10.0,
+        critic_layer_norm: bool = True,
         device: str = "cpu",
     ) -> None:
         if latent_dim < 1:
@@ -101,8 +103,8 @@ class PEARLAgent:
         self.actor = SquashedGaussianActor(
             observation_dim, action_dim, hidden_dim, action_low_tensor, action_high_tensor, latent_dim
         ).to(self.device)
-        self.q1 = QNetwork(observation_dim, action_dim, hidden_dim, latent_dim).to(self.device)
-        self.q2 = QNetwork(observation_dim, action_dim, hidden_dim, latent_dim).to(self.device)
+        self.q1 = QNetwork(observation_dim, action_dim, hidden_dim, latent_dim, critic_layer_norm).to(self.device)
+        self.q2 = QNetwork(observation_dim, action_dim, hidden_dim, latent_dim, critic_layer_norm).to(self.device)
         self.target_q1 = deepcopy(self.q1).eval()
         self.target_q2 = deepcopy(self.q2).eval()
         self.actor_optimizer = torch.optim.Adam(self.actor.parameters(), lr=actor_lr)
@@ -127,6 +129,14 @@ class PEARLAgent:
         self.kl_free_bits = kl_free_bits
         self.reward_scale = reward_scale
         self.gradient_clip_norm = gradient_clip_norm
+        if max_reward is not None and max_reward <= 0:
+            raise ValueError("max_reward must be positive when supplied.")
+        # Upper bound on one step of the soft Bellman target: the largest
+        # scaled reward plus the largest possible entropy bonus. The squashed
+        # policy's entropy can never exceed that of a uniform distribution
+        # over the action box, sum(log(high - low)).
+        self.max_scaled_reward = None if max_reward is None else reward_scale * max_reward
+        self.max_policy_entropy = float(torch.log(action_high_tensor - action_low_tensor).sum())
         self.bc_log_std_target = -2.0
         self.bc_log_std_weight = 0.01
 
@@ -190,32 +200,22 @@ class PEARLAgent:
         action, _ = self.actor(observation_tensor, latent_tensor, deterministic=deterministic)
         return action.squeeze(0).cpu().numpy()
 
-    def behavior_clone(self, task_batch: TaskBatch, prior_context: bool = False) -> dict[str, float]:
-        """Clone expert actions under either a context prefix or the prior.
+    def behavior_clone(self, task_batch: TaskBatch) -> dict[str, float]:
+        """Task-agnostic behavior cloning of the actor under ``z = 0``.
 
-        ``prior_context`` explicitly trains the empty-context policy used for
-        the first action after a reset. Otherwise, the latent comes from the
-        chronological task context supplied by the caller.
+        As in the original PEARL, the encoder is trained only by the critic
+        loss and KL term. Cloning through the encoder made ``z`` encode
+        whatever predicted expert actions, and that meaning then shifted once
+        critic training took over. ``task_batch.context`` is ignored.
         """
         observations = self._flatten(task_batch.rl.observations)
         actions = self._flatten(task_batch.rl.actions)
-        _, transitions = task_batch.rl.observations.shape[:2]
-        if prior_context or task_batch.context.observations.shape[1] == 0:
-            latents = torch.zeros((len(task_batch.task_ids) * transitions, self.latent_dim), device=self.device)
-        else:
-            context = self._tensor(context_from_batch(task_batch.context, self.reward_scale))
-            posterior_mean, posterior_log_variance = self.encoder(context)
-            latents = self._expand_latents(
-                self._sample_latents(posterior_mean, posterior_log_variance), transitions
-            )
+        latents = torch.zeros((len(observations), self.latent_dim), device=self.device)
         loss, action_loss, spread_loss = self._behavior_cloning_loss(observations, actions, latents)
         self.actor_optimizer.zero_grad()
-        self.encoder_optimizer.zero_grad()
         loss.backward()
         torch.nn.utils.clip_grad_norm_(self.actor.parameters(), self.gradient_clip_norm)
-        torch.nn.utils.clip_grad_norm_(self.encoder.parameters(), self.gradient_clip_norm)
         self.actor_optimizer.step()
-        self.encoder_optimizer.step()
         return {
             "loss/bc": loss.item(),
             "loss/bc_action": action_loss.item(),
@@ -254,6 +254,16 @@ class PEARLAgent:
                 self.target_q2(next_observations, next_actions, expanded_latents),
             )
             target_q = rewards + self.gamma * (1 - dones) * (next_q - self.alpha * next_log_prob)
+            clipped_fraction = torch.zeros((), device=self.device)
+            q_upper_bound = float("inf")
+            if self.max_scaled_reward is not None:
+                # No return can exceed this, so bootstrapped values above it
+                # are pure over-estimation; clipping stops them compounding.
+                q_upper_bound = (
+                    self.max_scaled_reward + self.alpha.item() * self.max_policy_entropy
+                ) / (1 - self.gamma)
+                clipped_fraction = (target_q > q_upper_bound).float().mean()
+                target_q = target_q.clamp(max=q_upper_bound)
 
         q1 = self.q1(observations, actions, expanded_latents)
         q2 = self.q2(observations, actions, expanded_latents)
@@ -280,9 +290,13 @@ class PEARLAgent:
             "loss/critic": critic_loss.item(),
             "stats/critic_gradient_norm": float(critic_gradient_norm),
             "stats/target_q": target_q.mean().item(),
+            "stats/q_max": torch.maximum(q1, q2).max().item(),
+            "stats/target_q_clipped_fraction": clipped_fraction.item(),
             "stats/meta_batch_tasks": float(tasks),
             "stats/context_length": float(context.shape[1]),
         }
+        if self.max_scaled_reward is not None:
+            metrics["stats/q_upper_bound"] = q_upper_bound
         if not empty_context:
             # Posterior statistics are only meaningful with context; logging
             # the k = 0 prior would mask whether inference is working.

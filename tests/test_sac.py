@@ -277,12 +277,10 @@ def test_demonstration_augmented_pearl_updates() -> None:
     initial_alpha = agent.alpha.item()
 
     pretrain_metrics = agent.behavior_clone(demo_batch)
-    prior_pretrain_metrics = agent.behavior_clone(demo_batch, prior_context=True)
     metrics = agent.update(mixed_batch, demo_batch, bc_weight=0.5)
 
     assert mixed_batch.rl.observations.shape == (2, 12, observation_dim)
     assert all(np.isfinite(value) for value in pretrain_metrics.values())
-    assert all(np.isfinite(value) for value in prior_pretrain_metrics.values())
     assert all(np.isfinite(value) for value in metrics.values())
     assert metrics["loss/bc"] >= 0
     assert metrics["loss/alpha"] == 0
@@ -390,3 +388,62 @@ def test_latent_for_episode_uses_prior_first_then_context() -> None:
     assert first_context is None and np.all(first_latent == 0)
     assert later_context is not None and later_context.observations.shape == (5, 8)
     assert later_latent.shape == (3,)
+
+
+def _random_multitask_buffer(observation_dim: int, action_dim: int, reward: float = 1.0) -> MultiTaskReplayBuffer:
+    buffer = MultiTaskReplayBuffer(range(2), observation_dim, action_dim, capacity=32)
+    for task_id in range(2):
+        for _ in range(32):
+            buffer.add(
+                task_id,
+                np.random.randn(observation_dim),
+                np.random.uniform(-1, 1, action_dim),
+                reward,
+                np.random.randn(observation_dim),
+                False,
+            )
+    return buffer
+
+
+def test_behavior_cloning_does_not_train_the_encoder() -> None:
+    """PEARL's encoder learns only from the critic loss and KL."""
+    agent = PEARLAgent(3, np.full(2, -1.0), np.full(2, 1.0), latent_dim=4, hidden_dim=16)
+    encoder_before = [parameter.detach().clone() for parameter in agent.encoder.parameters()]
+    actor_before = [parameter.detach().clone() for parameter in agent.actor.parameters()]
+
+    agent.behavior_clone(_random_multitask_buffer(3, 2).sample_meta_batch(2, 8, 6))
+
+    assert all(torch.equal(before, after) for before, after in zip(encoder_before, agent.encoder.parameters()))
+    assert any(not torch.equal(before, after) for before, after in zip(actor_before, agent.actor.parameters()))
+
+
+def test_critic_uses_layer_norm_by_default() -> None:
+    agent = PEARLAgent(3, np.full(2, -1.0), np.full(2, 1.0), latent_dim=4, hidden_dim=16)
+    plain = PEARLAgent(3, np.full(2, -1.0), np.full(2, 1.0), latent_dim=4, hidden_dim=16, critic_layer_norm=False)
+    assert any(isinstance(layer, torch.nn.LayerNorm) for layer in agent.q1.network)
+    assert not any(isinstance(layer, torch.nn.LayerNorm) for layer in plain.q1.network)
+
+
+def test_td_targets_are_capped_at_the_largest_achievable_return() -> None:
+    observation_dim, action_dim = 3, 2
+    agent = PEARLAgent(
+        observation_dim,
+        np.full(action_dim, -1.0),
+        np.full(action_dim, 1.0),
+        latent_dim=4,
+        hidden_dim=16,
+        reward_scale=0.1,
+        max_reward=10.0,
+        fixed_alpha=0.1,
+    )
+    # Push the target critics far above any achievable return.
+    with torch.no_grad():
+        for target in (agent.target_q1, agent.target_q2):
+            target.network[-1].bias.fill_(1e4)
+
+    metrics = agent.update_critic(_random_multitask_buffer(observation_dim, action_dim).sample_meta_batch(2, 8, 6))
+
+    expected_bound = (0.1 * 10.0 + 0.1 * action_dim * np.log(2.0)) / (1 - agent.gamma)
+    assert np.isclose(metrics["stats/q_upper_bound"], expected_bound, rtol=1e-5)
+    assert metrics["stats/target_q_clipped_fraction"] == 1.0
+    assert metrics["stats/target_q"] <= expected_bound + 1e-4

@@ -127,6 +127,19 @@ def parse_args() -> TrainConfig:
         default=0.02,
         help="Starting PEARL entropy coefficient (scaled-reward units) when it is tuned automatically.",
     )
+    parser.add_argument(
+        "--pearl-max-reward",
+        type=float,
+        default=10.0,
+        help="Largest per-step environment reward (MetaWorld: 10). Caps PEARL's TD targets at the largest "
+        "achievable return; set to 0 to disable.",
+    )
+    parser.add_argument(
+        "--pearl-critic-layer-norm",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Use LayerNorm in PEARL's critics to limit value extrapolation.",
+    )
     parser.add_argument("--gradient-clip-norm", type=float, default=10.0)
     parser.add_argument("--min-posterior-std", type=float, default=0.05)
     parser.add_argument(
@@ -674,6 +687,8 @@ def train_pearl(config: TrainConfig) -> None:
         initial_alpha=config.pearl_initial_alpha,
         gradient_clip_norm=config.gradient_clip_norm,
         min_posterior_std=config.min_posterior_std,
+        max_reward=config.pearl_max_reward if config.pearl_max_reward > 0 else None,
+        critic_layer_norm=config.pearl_critic_layer_norm,
         device=device,
     )
     buffer = MultiTaskReplayBuffer(
@@ -695,15 +710,11 @@ def train_pearl(config: TrainConfig) -> None:
         if config.pearl_bc_pretrain_updates < 0:
             raise ValueError("--pearl-bc-pretrain-updates must be non-negative.")
         for update in range(1, config.pearl_bc_pretrain_updates + 1):
-            # k = 0 (empty context, z = 0) is sampled like any other k, which
-            # trains the first-episode policy used at deployment.
-            demonstration_batch, _ = contextualize_task_batch(
-                demonstrations.sample_meta_batch(config.meta_batch_size, config.batch_size, 1),
-                demonstration_contexts,
-                builder,
-                config.adaptation_episodes,
+            # Task-agnostic warm start under z = 0. The encoder is left alone
+            # and later learns only from the critic loss and KL, as in PEARL.
+            metrics = agent.behavior_clone(
+                demonstrations.sample_meta_batch(config.meta_batch_size, config.batch_size, 1)
             )
-            metrics = agent.behavior_clone(demonstration_batch)
             if update % 100 == 0 or update == config.pearl_bc_pretrain_updates:
                 writer.add_scalar("pretrain/pearl_bc_loss", metrics["loss/bc"], update)
         if config.pearl_critic_pretrain_updates < 0:

@@ -55,9 +55,11 @@ Phase 4 introduces hidden object properties.
 - Object and goal positions are still randomized on every reset within each
   task. This ensures that PEARL must infer dynamics from transitions rather
   than using a visible configuration as a task label.
-- PEARL behavior-clones both its actor and context encoder on the same
-  context shapes used at deployment (see "Encoder context" below), including
-  the empty context (`z = 0`) of each task's first episode. It then uses the retained task-specific demonstrations
+- PEARL first behavior-clones only its actor, task-agnostically under
+  `z = 0`. As in the original PEARL, the context encoder is trained only by
+  the critic loss and KL term, in every phase; cloning through the encoder
+  made the latent's meaning shift once critic training took over. It then
+  uses the retained task-specific demonstrations
   in mixed online/offline updates with a cloning-loss floor instead of removing
   the expert anchor entirely.
 - PEARL now behavior-clones both the deterministic action and a conservative
@@ -78,6 +80,20 @@ Phase 4 introduces hidden object properties.
   of resampling a different latent at every environment step. A posterior
   standard-deviation floor prevents the context encoder from becoming
   arbitrarily overconfident.
+
+### Critic stability
+
+The critic's TD targets are capped at the largest achievable soft return,
+`(pearl_max_reward * pearl_reward_scale + alpha * max_entropy) / (1 - gamma)`,
+where `max_entropy` is the entropy of a uniform policy over the action box.
+With MetaWorld's maximum reward of 10 and a reward scale of 0.1 that is about
+100 plus the entropy allowance. The critics also use LayerNorm, which limits
+how far Q can extrapolate on unfamiliar actions and latents. An earlier run
+without these safeguards reached Q values about 20 times the achievable
+maximum. Use `--pearl-max-reward 0` or `--no-pearl-critic-layer-norm` to turn
+them off. TensorBoard logs `stats/q_max`, `stats/q_upper_bound` and
+`stats/target_q_clipped_fraction`. A clipped fraction that stays above a few
+percent means the critic is still pushing against the cap.
 
 ### Encoder context
 

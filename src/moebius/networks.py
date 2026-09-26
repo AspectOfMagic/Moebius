@@ -8,14 +8,16 @@ from torch.nn import functional as F
 from torch.distributions import Normal
 
 
-def mlp(input_dim: int, output_dim: int, hidden_dim: int) -> nn.Sequential:
-    return nn.Sequential(
-        nn.Linear(input_dim, hidden_dim),
-        nn.ReLU(),
-        nn.Linear(hidden_dim, hidden_dim),
-        nn.ReLU(),
-        nn.Linear(hidden_dim, output_dim),
-    )
+def mlp(input_dim: int, output_dim: int, hidden_dim: int, layer_norm: bool = False) -> nn.Sequential:
+    """Two hidden ReLU layers, optionally with LayerNorm before each ReLU."""
+    layers: list[nn.Module] = []
+    for layer_input in (input_dim, hidden_dim):
+        layers.append(nn.Linear(layer_input, hidden_dim))
+        if layer_norm:
+            layers.append(nn.LayerNorm(hidden_dim))
+        layers.append(nn.ReLU())
+    layers.append(nn.Linear(hidden_dim, output_dim))
+    return nn.Sequential(*layers)
 
 
 class SquashedGaussianActor(nn.Module):
@@ -72,11 +74,18 @@ class SquashedGaussianActor(nn.Module):
 
 
 class QNetwork(nn.Module):
-    """State-action value function, optionally conditioned on a PEARL latent."""
+    """State-action value function, optionally conditioned on a PEARL latent.
 
-    def __init__(self, observation_dim: int, action_dim: int, hidden_dim: int, latent_dim: int = 0) -> None:
+    ``layer_norm`` bounds the hidden features, which limits how far Q can
+    extrapolate on unfamiliar actions and latents (a common cause of
+    off-policy value divergence).
+    """
+
+    def __init__(
+        self, observation_dim: int, action_dim: int, hidden_dim: int, latent_dim: int = 0, layer_norm: bool = False
+    ) -> None:
         super().__init__()
-        self.network = mlp(observation_dim + action_dim + latent_dim, 1, hidden_dim)
+        self.network = mlp(observation_dim + action_dim + latent_dim, 1, hidden_dim, layer_norm)
 
     def forward(self, observation: Tensor, action: Tensor, latent: Tensor | None = None) -> Tensor:
         inputs = (observation, action) if latent is None else (observation, action, latent)
