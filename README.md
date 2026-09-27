@@ -81,6 +81,17 @@ Phase 4 introduces hidden object properties.
   standard-deviation floor prevents the context encoder from becoming
   arbitrarily overconfident.
 
+### Failed expert attempts
+
+The scripted expert ignores the hidden properties, and only its successful
+rollouts become demonstrations, so the demonstrations make every object look
+equally easy. Its failed attempts on each accepted training task (the ones
+made before it reached the required successes) are now added to the online
+replay and context buffers. They show the same behavior leading to different
+outcomes on different objects, which is the task-dependent value signal the
+encoder needs. They are never behavior-cloned. Disable with
+`--no-pearl-replay-failed-demos`; `demo/pearl_failed_episodes` counts them.
+
 ### Critic stability
 
 The critic's TD targets are capped at the largest achievable soft return,
@@ -261,12 +272,17 @@ latent. Omit `--adaptation-episodes` to use the value saved in the checkpoint.
 Use `--task-index` to select another held-out task configuration.
 
 Videos are written to `videos/`. Use `--video-dir` or `--fps` to change the
-output folder or frame rate. Recording uses a top-down camera by default to
-keep the object visible. Other available camera angles include:
+output folder or frame rate. Recording uses the `corner` camera by default.
+MuJoCo renders that camera upside down, so its frames are rotated 180 degrees
+automatically. Other camera angles are available, for example the top-down
+view:
 
 ```bash
-moebius-record --checkpoint checkpoints/pick-place-v3_sac_seed1.pt --camera-name corner2
+moebius-record --checkpoint checkpoints/pick-place-v3_sac_seed1.pt --camera-name topview
 ```
+
+If another camera also comes out upside down, add `--rotate-180`; use
+`--no-rotate-180` to turn the automatic correction off.
 
 The final checkpoint is saved to `checkpoints/`. Tests that do not require a
 MuJoCo installation can be run with:

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import argparse
 import random
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 import numpy as np
@@ -133,6 +133,13 @@ def parse_args() -> TrainConfig:
         default=10.0,
         help="Largest per-step environment reward (MetaWorld: 10). Caps PEARL's TD targets at the largest "
         "achievable return; set to 0 to disable.",
+    )
+    parser.add_argument(
+        "--pearl-replay-failed-demos",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Add the scripted expert's failed attempts on accepted training tasks to the online replay and "
+        "context buffers (never behavior-cloned).",
     )
     parser.add_argument(
         "--pearl-critic-layer-norm",
@@ -419,6 +426,9 @@ class FeasibleDynamicsData:
     sampler: DynamicsTaskSampler
     demonstrations: MultiTaskReplayBuffer | None
     contexts: AdaptationContextBuffer | None
+    # Unsuccessful expert attempts on each accepted training task, in the
+    # order collected. Never cloned; optionally replayed as online experience.
+    failed_trajectories: dict[int, list[Trajectory]] = field(default_factory=dict)
 
 
 def collect_feasible_dynamics_data(
@@ -465,8 +475,10 @@ def collect_feasible_dynamics_data(
     environment = MetaWorldSingleTaskEnv(config.env_name, config.seed + 3, config.max_episode_steps)
     expert = _pick_place_expert()
 
-    def successful_trajectories(task: TaskSpec, split: str) -> tuple[list[Trajectory], int]:
+    def expert_trajectories(task: TaskSpec, split: str) -> tuple[list[Trajectory], list[Trajectory], int]:
+        """Return (successes, failures, attempts) for one property vector."""
         trajectories: list[Trajectory] = []
+        failures: list[Trajectory] = []
         for attempt in range(1, max_attempts + 1):
             observation = _reset_task(environment, task)
             terminated = truncated = False
@@ -487,15 +499,19 @@ def collect_feasible_dynamics_data(
             if success:
                 trajectories.append(trajectory)
                 if len(trajectories) == required_successes:
-                    return trajectories, attempt
-        return trajectories, max_attempts
+                    return trajectories, failures, attempt
+            else:
+                failures.append(trajectory)
+        return trajectories, failures, max_attempts
+
+    failed_trajectories: dict[int, list[Trajectory]] = {}
 
     def accept_tasks(tasks: tuple[TaskSpec, ...], split: str, retain: bool) -> tuple[TaskSpec, ...]:
         accepted_tasks: list[TaskSpec] = []
         for original_task in tasks:
             candidate = original_task
             for candidate_index in range(1, config.max_property_candidates_per_task + 1):
-                trajectories, attempts = successful_trajectories(candidate, split)
+                trajectories, failures, attempts = expert_trajectories(candidate, split)
                 if len(trajectories) == required_successes:
                     accepted_tasks.append(candidate)
                     print(
@@ -511,6 +527,9 @@ def collect_feasible_dynamics_data(
                             episodes.append(episode_batch(*zip(*trajectory, strict=True)))
                         for offset in range(len(episodes)):
                             contexts.add_sequence(candidate.task_id, episodes[offset:] + episodes[:offset])
+                        # Failures of rejected candidates belong to other
+                        # property vectors, so only the accepted one's are kept.
+                        failed_trajectories[candidate.task_id] = failures
                     writer.add_scalar(f"demo/{split}_task_{candidate.task_id}_attempts", attempts, 0)
                     break
                 candidate = sampler.resample_task(original_task.task_id)
@@ -529,7 +548,8 @@ def collect_feasible_dynamics_data(
         environment.close()
 
     writer.add_scalar("demo/pearl_transitions", sum(demonstrations.size(task.task_id) for task in sampler.train_tasks), 0)
-    return FeasibleDynamicsData(sampler, demonstrations, contexts)
+    writer.add_scalar("demo/pearl_failed_episodes", sum(len(failures) for failures in failed_trajectories.values()), 0)
+    return FeasibleDynamicsData(sampler, demonstrations, contexts, failed_trajectories)
 
 
 def contextualize_task_batch(
@@ -648,6 +668,36 @@ def evaluate_pearl(
     return PearlEvaluation(returns / count, successes / count, posterior_stds / count, motion_fractions / count)
 
 
+def seed_failed_expert_attempts(
+    failed_trajectories: dict[int, list[Trajectory]],
+    buffer: MultiTaskReplayBuffer,
+    contexts: AdaptationContextBuffer,
+    writer: SummaryWriter,
+) -> int:
+    """Add failed expert attempts to the online replay and context buffers.
+
+    The scripted expert ignores the hidden properties, so its failures show
+    the same behavior leading to different outcomes on different objects.
+    That is the task-dependent value signal the encoder needs. They are
+    stored as ordinary experience (never behavior-cloned), and each task's
+    failures form one adaptation sequence in the order they were collected.
+    Online sequences gradually replace them in the context buffer; the
+    replay buffer keeps them.
+    """
+    transitions = 0
+    for task_id, trajectories in failed_trajectories.items():
+        if not trajectories:
+            continue
+        for trajectory in trajectories:
+            for transition in trajectory:
+                buffer.add(task_id, *transition)
+            transitions += len(trajectory)
+        contexts.add_sequence(task_id, [episode_batch(*zip(*trajectory, strict=True)) for trajectory in trajectories])
+    writer.add_scalar("demo/pearl_failed_transitions_replayed", transitions, 0)
+    print(f"replayed {transitions} transitions from failed expert attempts")
+    return transitions
+
+
 def train_pearl(config: TrainConfig) -> None:
     if config.meta_batch_size > config.num_train_tasks:
         raise ValueError("--meta-batch-size cannot exceed --num-train-tasks.")
@@ -662,9 +712,11 @@ def train_pearl(config: TrainConfig) -> None:
     writer = SummaryWriter(config.log_dir / run_name)
     writer.add_text("config", str(asdict(config)))
     demonstration_data: tuple[MultiTaskReplayBuffer, AdaptationContextBuffer] | None = None
+    failed_trajectories: dict[int, list[Trajectory]] = {}
     if isinstance(task_sampler, DynamicsTaskSampler):
         feasible_data = collect_feasible_dynamics_data(config, task_sampler, observation_dim, action_dim, writer)
         task_sampler = feasible_data.sampler
+        failed_trajectories = feasible_data.failed_trajectories
         if feasible_data.demonstrations is not None and feasible_data.contexts is not None:
             demonstration_data = feasible_data.demonstrations, feasible_data.contexts
     agent = PEARLAgent(
@@ -701,6 +753,8 @@ def train_pearl(config: TrainConfig) -> None:
         max_sequences_per_task=config.context_sequences_per_task,
         seed=config.seed + 40_000,
     )
+    if config.pearl_replay_failed_demos:
+        seed_failed_expert_attempts(failed_trajectories, buffer, online_contexts, writer)
     builder = context_builder(config)
     rollout_rng = np.random.default_rng(config.seed + 50_000)
     evaluation_rng = np.random.default_rng(config.seed + 60_000)

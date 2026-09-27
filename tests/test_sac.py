@@ -16,7 +16,7 @@ from moebius.replay_buffer import (
     concatenate_task_batch_rl,
 )
 from moebius.sac import SACAgent
-from moebius.train import demonstration_batch_sizes, online_bc_weight, pearl_online_bc_weight
+from moebius.train import demonstration_batch_sizes, online_bc_weight, pearl_online_bc_weight, seed_failed_expert_attempts
 
 
 def test_actor_respects_action_bounds() -> None:
@@ -447,3 +447,31 @@ def test_td_targets_are_capped_at_the_largest_achievable_return() -> None:
     assert np.isclose(metrics["stats/q_upper_bound"], expected_bound, rtol=1e-5)
     assert metrics["stats/target_q_clipped_fraction"] == 1.0
     assert metrics["stats/target_q"] <= expected_bound + 1e-4
+
+
+def test_failed_expert_attempts_are_replayed_as_experience_not_demonstrations() -> None:
+    observation_dim, action_dim = 8, 2
+
+    def trajectory(steps: int) -> list:
+        return [
+            (np.zeros(observation_dim), np.zeros(action_dim), 0.0, np.zeros(observation_dim), False)
+            for _ in range(steps)
+        ]
+
+    class _Writer:
+        def __init__(self) -> None:
+            self.scalars: dict[str, float] = {}
+
+        def add_scalar(self, name: str, value: float, step: int) -> None:
+            self.scalars[name] = value
+
+    buffer = MultiTaskReplayBuffer(range(3), observation_dim, action_dim, capacity=64)
+    contexts = AdaptationContextBuffer(range(3), observation_dim, action_dim, seed=0)
+    writer = _Writer()
+
+    replayed = seed_failed_expert_attempts({0: [trajectory(5), trajectory(4)], 1: []}, buffer, contexts, writer)
+
+    assert replayed == 9 and writer.scalars["demo/pearl_failed_transitions_replayed"] == 9
+    assert buffer.size(0) == 9 and buffer.size(1) == 0 and buffer.size(2) == 0
+    # Both failed episodes form one adaptation sequence for task 0.
+    assert contexts.max_previous_episodes(0) == 2 and contexts.max_previous_episodes(1) == 0

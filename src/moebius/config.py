@@ -71,6 +71,9 @@ class TrainConfig:
     # to disable. LayerNorm in the critics limits value extrapolation.
     pearl_max_reward: float = 10.0
     pearl_critic_layer_norm: bool = True
+    # Store the scripted expert's failed attempts (accepted training tasks
+    # only) as online experience and context. Never behavior-cloned.
+    pearl_replay_failed_demos: bool = True
     gradient_clip_norm: float = 10.0
     min_posterior_std: float = 0.05
     # Encoder context: built from the completed episodes earlier in the same
