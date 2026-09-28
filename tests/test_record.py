@@ -34,12 +34,3 @@ def test_load_pearl_agent_restores_encoder_and_latent_policy() -> None:
     action = restored.act(np.zeros(observation_dim, dtype=np.float32), deterministic=True)
     assert action.shape == (action_dim,)
 
-
-def test_corner_camera_frames_are_rotated_by_default() -> None:
-    from moebius.record import should_rotate_frames
-
-    assert should_rotate_frames("corner", None) is True
-    assert should_rotate_frames("topview", None) is False
-    # Explicit flags override the default in both directions.
-    assert should_rotate_frames("corner", False) is False
-    assert should_rotate_frames("corner3", True) is True

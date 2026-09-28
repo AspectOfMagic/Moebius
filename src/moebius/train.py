@@ -181,6 +181,13 @@ def parse_args() -> TrainConfig:
     parser.add_argument("--meta-batch-size", type=int, default=8)
     parser.add_argument("--context-size", type=int, default=64)
     parser.add_argument("--adaptation-episodes", type=int, default=3)
+    parser.add_argument(
+        "--pearl-eval-sequences-per-task",
+        type=int,
+        default=1,
+        help="Adaptation sequences run per held-out task at each PEARL evaluation. Each sequence costs "
+        "(adaptation_episodes + 1) episodes per task.",
+    )
     args = parser.parse_args()
     return TrainConfig(**vars(args))
 
@@ -601,11 +608,17 @@ def _pearl_episode(
     previous_episodes: list[Batch],
     builder: ContextBuilder,
     rng: np.random.Generator,
-    deterministic: bool,
 ) -> PearlEpisodeResult:
-    """Run one adaptation episode using the shared latent-selection rule."""
+    """Run one evaluation episode with PEARL's evaluation protocol.
+
+    As in the original PEARL, every evaluation episode samples z from the
+    current posterior (z = 0 before any context) and acts with the policy's
+    mean action. Only the context differs between adaptation steps, so a
+    change in success across steps reflects adaptation rather than a switch
+    from stochastic to deterministic actions.
+    """
     observation = _reset_task(environment, task)
-    episode_latent, context = agent.latent_for_episode(previous_episodes, builder, rng, deterministic=deterministic)
+    episode_latent, context = agent.latent_for_episode(previous_episodes, builder, rng, deterministic=False)
     posterior_std = 1.0
     if context is not None:
         _, std = agent.posterior(context_from_batch(context, agent.reward_scale))
@@ -615,7 +628,7 @@ def _pearl_episode(
     info: dict[str, float] = {}
     transitions = []
     while not (terminated or truncated):
-        action = agent.act(observation, deterministic=deterministic, latent=episode_latent)
+        action = agent.act(observation, deterministic=True, latent=episode_latent)
         next_observation, reward, terminated, truncated, info = environment.step(action)
         transitions.append((observation, action, reward, next_observation, terminated))
         observation = next_observation
@@ -631,10 +644,15 @@ def _pearl_episode(
 
 @dataclass
 class PearlEvaluation:
+    """Averages per adaptation step (index k = number of earlier episodes)."""
+
     returns: np.ndarray
     successes: np.ndarray
     posterior_stds: np.ndarray
     context_motion_fractions: np.ndarray
+    # Success rate of each task, averaged over its sequences and steps.
+    task_successes: np.ndarray
+    episodes_per_step: int
 
 
 def evaluate_pearl(
@@ -644,28 +662,40 @@ def evaluate_pearl(
     adaptation_episodes: int,
     builder: ContextBuilder,
     rng: np.random.Generator,
+    sequences_per_task: int = 1,
 ) -> PearlEvaluation:
-    """Measure return, success and posterior width as context accumulates."""
+    """Measure return, success and posterior width as context accumulates.
+
+    Each task runs ``sequences_per_task`` independent adaptation sequences of
+    ``adaptation_episodes + 1`` episodes, each starting from an empty context.
+    """
+    if sequences_per_task < 1:
+        raise ValueError("sequences_per_task must be positive.")
     steps = adaptation_episodes + 1
     returns, successes = np.zeros(steps), np.zeros(steps)
     posterior_stds, motion_fractions = np.zeros(steps), np.zeros(steps)
-    for task in tasks:
-        previous_episodes: list[Batch] = []
-        for adaptation_step in range(steps):
-            # The first rollout uses z = 0. Later rollouts use context built
-            # from all earlier episodes on the same task.
-            deterministic = adaptation_step == adaptation_episodes
-            result = _pearl_episode(
-                agent, environment, task, previous_episodes, builder, rng, deterministic=deterministic
-            )
-            previous_episodes.append(result.episode)
-            returns[adaptation_step] += result.episode_return
-            successes[adaptation_step] += result.success
-            posterior_stds[adaptation_step] += result.posterior_std
-            if result.context is not None:
-                motion_fractions[adaptation_step] += builder.motion_fraction_of(result.context)
-    count = len(tasks)
-    return PearlEvaluation(returns / count, successes / count, posterior_stds / count, motion_fractions / count)
+    task_successes = np.zeros(len(tasks))
+    for task_index, task in enumerate(tasks):
+        for _ in range(sequences_per_task):
+            previous_episodes: list[Batch] = []
+            for adaptation_step in range(steps):
+                result = _pearl_episode(agent, environment, task, previous_episodes, builder, rng)
+                previous_episodes.append(result.episode)
+                returns[adaptation_step] += result.episode_return
+                successes[adaptation_step] += result.success
+                task_successes[task_index] += result.success
+                posterior_stds[adaptation_step] += result.posterior_std
+                if result.context is not None:
+                    motion_fractions[adaptation_step] += builder.motion_fraction_of(result.context)
+    count = len(tasks) * sequences_per_task
+    return PearlEvaluation(
+        returns / count,
+        successes / count,
+        posterior_stds / count,
+        motion_fractions / count,
+        task_successes / (sequences_per_task * steps),
+        count,
+    )
 
 
 def seed_failed_expert_attempts(
@@ -719,6 +749,9 @@ def train_pearl(config: TrainConfig) -> None:
         failed_trajectories = feasible_data.failed_trajectories
         if feasible_data.demonstrations is not None and feasible_data.contexts is not None:
             demonstration_data = feasible_data.demonstrations, feasible_data.contexts
+    # Property vectors of the (accepted) tasks, for reading per-task metrics.
+    for split, split_tasks in (("train", task_sampler.train_tasks), ("test", task_sampler.test_tasks)):
+        writer.add_text(f"tasks/{split}", "\n\n".join(str(asdict(task)) for task in split_tasks))
     agent = PEARLAgent(
         observation_dim=observation_dim,
         action_low=environment.action_space.low,
@@ -823,6 +856,10 @@ def train_pearl(config: TrainConfig) -> None:
                 writer.add_scalar("train/episode_return", episode_return, step)
                 writer.add_scalar("train/episode_length", episode_length, step)
                 writer.add_scalar("train/success", float(info.get("success", False)), step)
+                # Per-task outcomes; pair with the "tasks/train" text summary
+                # to see whether failures concentrate on particular objects.
+                writer.add_scalar(f"train_task/task_{task.task_id}_success", float(info.get("success", False)), step)
+                writer.add_scalar(f"train_task/task_{task.task_id}_return", episode_return, step)
                 episodes_on_task += 1
                 if episodes_on_task >= config.adaptation_episodes + 1:
                     task = task_sampler.sample_train_task()
@@ -885,8 +922,18 @@ def train_pearl(config: TrainConfig) -> None:
                     config.adaptation_episodes,
                     builder,
                     evaluation_rng,
+                    config.pearl_eval_sequences_per_task,
                 )
                 evaluation_successes = evaluation.successes
+                # Positive when context improves success. Its standard error is
+                # roughly 0.7 / sqrt(episodes_per_step) at 30% success.
+                writer.add_scalar(
+                    "eval/adaptation_gain", evaluation.successes[-1] - evaluation.successes[0], step
+                )
+                writer.add_scalar("eval/success_mean", float(evaluation.successes.mean()), step)
+                writer.add_scalar("eval/episodes_per_step", evaluation.episodes_per_step, step)
+                for task, task_success in zip(task_sampler.test_tasks, evaluation.task_successes, strict=True):
+                    writer.add_scalar(f"eval_task/task_{task.task_id}_success", task_success, step)
                 for adaptation_step in range(config.adaptation_episodes + 1):
                     writer.add_scalar(
                         f"eval/return_after_context_{adaptation_step}", evaluation.returns[adaptation_step], step

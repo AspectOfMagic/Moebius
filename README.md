@@ -239,6 +239,24 @@ For PEARL, inspect `loss/kl`, `stats/z_mean`, `stats/z_std`, and especially
 improving held-out success curve as context episodes accumulate is the Phase 2
 adaptation signal.
 
+Evaluation follows the original PEARL protocol. Every held-out episode samples
+`z` from the current posterior (`z = 0` before any context) and uses the
+policy's mean action. Adaptation step `k` is therefore the only thing that
+changes between `eval/success_after_context_0` and
+`eval/success_after_context_k`, and `eval/adaptation_gain` (last step minus
+the first) measures what context adds. Each evaluation runs
+`--pearl-eval-sequences-per-task` independent adaptation sequences per
+held-out task (default 1; `eval/episodes_per_step` reports the resulting
+sample size). With 10 held-out tasks, one sequence gives only 10 episodes per
+step, roughly +/-14 points of noise at 30% success. For comparisons between
+runs, use 3 or more sequences with a longer `--eval-interval` (for example
+`--pearl-eval-sequences-per-task 3 --eval-interval 30000`), or average
+several evaluations.
+
+Per-task results are logged as `eval_task/task_<id>_success` and
+`train_task/task_<id>_success` / `_return`. The `tasks/train` and `tasks/test`
+text entries list each task's hidden property values.
+
 To check that task inference is alive:
 
 - `stats/z_std` should fall clearly below 1, and `eval/z_std_after_context_k`
@@ -266,9 +284,10 @@ moebius-record --checkpoint checkpoints/pick-place-v3_pearl_seed1.pt \
   --task-index 0 --adaptation-episodes 3
 ```
 
-This produces one stochastic context-collection video per adaptation episode,
-followed by a deterministic `*_adapted.mp4` rollout using the inferred task
-latent. Omit `--adaptation-episodes` to use the value saved in the checkpoint.
+This produces one context-collection video per adaptation episode, followed by
+an `*_adapted.mp4` rollout. Every episode follows the evaluation protocol: `z`
+is sampled from the posterior over the earlier episodes, and actions are the
+policy's mean. Omit `--adaptation-episodes` to use the value saved in the checkpoint.
 Use `--task-index` to select another held-out task configuration.
 
 Videos are written to `videos/`. Use `--video-dir` or `--fps` to change the
@@ -281,8 +300,8 @@ view:
 moebius-record --checkpoint checkpoints/pick-place-v3_sac_seed1.pt --camera-name topview
 ```
 
-If another camera also comes out upside down, add `--rotate-180`; use
-`--no-rotate-180` to turn the automatic correction off.
+To correct another camera that renders upside down, add its name to
+`UPSIDE_DOWN_CAMERAS` in `record.py`.
 
 The final checkpoint is saved to `checkpoints/`. Tests that do not require a
 MuJoCo installation can be run with:

@@ -90,6 +90,10 @@ class TrainConfig:
     meta_batch_size: int = 8
     context_size: int = 64
     adaptation_episodes: int = 3
+    # Independent adaptation sequences per held-out task at each evaluation.
+    # More sequences reduce noise but cost (adaptation_episodes + 1) episodes
+    # per task each.
+    pearl_eval_sequences_per_task: int = 1
     max_episode_steps: int = 500
     eval_interval: int = 10_000
     eval_episodes: int = 10

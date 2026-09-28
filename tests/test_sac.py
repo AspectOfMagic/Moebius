@@ -16,7 +16,13 @@ from moebius.replay_buffer import (
     concatenate_task_batch_rl,
 )
 from moebius.sac import SACAgent
-from moebius.train import demonstration_batch_sizes, online_bc_weight, pearl_online_bc_weight, seed_failed_expert_attempts
+from moebius.train import (
+    demonstration_batch_sizes,
+    evaluate_pearl,
+    online_bc_weight,
+    pearl_online_bc_weight,
+    seed_failed_expert_attempts,
+)
 
 
 def test_actor_respects_action_bounds() -> None:
@@ -475,3 +481,48 @@ def test_failed_expert_attempts_are_replayed_as_experience_not_demonstrations() 
     assert buffer.size(0) == 9 and buffer.size(1) == 0 and buffer.size(2) == 0
     # Both failed episodes form one adaptation sequence for task 0.
     assert contexts.max_previous_episodes(0) == 2 and contexts.max_previous_episodes(1) == 0
+
+
+def test_pearl_evaluation_uses_mean_actions_and_sampled_latents_at_every_step() -> None:
+    from moebius.envs import TaskSpec
+
+    observation_dim, action_dim, episode_length = 8, 2, 5
+
+    class _FakeEnvironment:
+        def set_task_properties(self, task: TaskSpec) -> None:
+            pass
+
+        def reset(self, seed: int | None = None):
+            self.steps = 0
+            return np.zeros(observation_dim, dtype=np.float32), {}
+
+        def step(self, action: np.ndarray):
+            self.steps += 1
+            observation = np.full(observation_dim, self.steps, dtype=np.float32)
+            return observation, 1.0, False, self.steps >= episode_length, {"success": True}
+
+    agent = PEARLAgent(observation_dim, np.full(action_dim, -1.0), np.full(action_dim, 1.0), latent_dim=3, hidden_dim=16)
+    action_modes, latent_modes = set(), set()
+    act, latent_for_episode = agent.act, agent.latent_for_episode
+
+    def recording_act(observation, context=None, deterministic=False, latent=None):
+        action_modes.add(deterministic)
+        return act(observation, context, deterministic, latent)
+
+    def recording_latent(previous_episodes, builder, rng, deterministic=False):
+        if previous_episodes:
+            latent_modes.add(deterministic)
+        return latent_for_episode(previous_episodes, builder, rng, deterministic)
+
+    agent.act, agent.latent_for_episode = recording_act, recording_latent
+    tasks = (TaskSpec(0), TaskSpec(1))
+
+    evaluation = evaluate_pearl(
+        agent, _FakeEnvironment(), tasks, 2, ContextBuilder(context_size=4), np.random.default_rng(0), sequences_per_task=3
+    )
+
+    assert action_modes == {True}
+    assert latent_modes == {False}
+    assert evaluation.episodes_per_step == 6
+    assert np.allclose(evaluation.successes, 1.0) and np.allclose(evaluation.task_successes, 1.0)
+    assert np.allclose(evaluation.returns, episode_length)

@@ -15,15 +15,7 @@ from moebius.pearl import PEARLAgent
 from moebius.replay_buffer import Batch
 
 
-# MetaWorld cameras whose orientation renders the scene upside down with
-# MuJoCo's current renderer. A camera can only rotate the image, never mirror
-# it, so the correction is a 180-degree rotation, not a vertical flip.
 UPSIDE_DOWN_CAMERAS = frozenset({"corner"})
-
-
-def should_rotate_frames(camera_name: str, rotate_180: bool | None) -> bool:
-    """An explicit --rotate-180/--no-rotate-180 wins; otherwise use the known list."""
-    return camera_name in UPSIDE_DOWN_CAMERAS if rotate_180 is None else rotate_180
 
 
 def parse_args() -> argparse.Namespace:
@@ -48,15 +40,7 @@ def parse_args() -> argparse.Namespace:
         "--camera-name",
         choices=("corner", "topview", "behindGripper", "gripperPOV", "corner2", "corner3", "corner4"),
         default="corner",
-        help="MetaWorld camera to use. 'corner' frames are rotated upright automatically (see --rotate-180); "
-        "'topview' gives the clearest overview of the object.",
-    )
-    parser.add_argument(
-        "--rotate-180",
-        action=argparse.BooleanOptionalAction,
-        default=None,
-        help="Rotate frames by 180 degrees. Default: on for cameras known to render upside down "
-        f"({', '.join(sorted(UPSIDE_DOWN_CAMERAS))}), off otherwise.",
+        help="MetaWorld camera to use. 'corner' frames are rotated upright automatically.",
     )
     parser.add_argument("--device", default="auto", help="'auto', 'cpu', or a PyTorch device such as 'cuda'.")
     return parser.parse_args()
@@ -140,7 +124,7 @@ def _append_frame(writer: imageio.Writer, environment: MetaWorldSingleTaskEnv, r
 def record_sac(
     actor: SquashedGaussianActor, environment: MetaWorldSingleTaskEnv, config: dict[str, Any], args: argparse.Namespace, device: str
 ) -> None:
-    rotate_180 = should_rotate_frames(args.camera_name, args.rotate_180)
+    rotate_180 = args.camera_name in UPSIDE_DOWN_CAMERAS
     for episode in range(args.episodes):
         observation, _ = environment.reset(seed=int(config["seed"]) + episode)
         video_path = args.video_dir / f"{config['env_name']}_episode_{episode + 1}.mp4"
@@ -165,16 +149,16 @@ def record_pearl_episode(
     rng: np.random.Generator,
     video_path: Path,
     fps: int,
-    deterministic: bool,
     rotate_180: bool = False,
 ) -> tuple[float, bool]:
-    """Record one context-collection or adapted PEARL rollout on one task.
+    """Record one PEARL rollout on one task, using the evaluation protocol.
 
-    The latent comes from the same rule used in training and evaluation, and
-    the finished episode is appended to ``previous_episodes``.
+    z is sampled from the posterior over ``previous_episodes`` (z = 0 when
+    there are none) and actions are the policy's mean. The finished episode
+    is appended to ``previous_episodes``.
     """
     observation = _reset_task(environment, task)
-    episode_latent, _ = agent.latent_for_episode(previous_episodes, builder, rng, deterministic=deterministic)
+    episode_latent, _ = agent.latent_for_episode(previous_episodes, builder, rng, deterministic=False)
     transitions = []
     episode_return = 0.0
     terminated = truncated = False
@@ -182,7 +166,7 @@ def record_pearl_episode(
     with imageio.get_writer(video_path, fps=fps) as writer:
         _append_frame(writer, environment, rotate_180)
         while not (terminated or truncated):
-            action = agent.act(observation, deterministic=deterministic, latent=episode_latent)
+            action = agent.act(observation, deterministic=True, latent=episode_latent)
             next_observation, reward, terminated, truncated, info = environment.step(action)
             transitions.append((observation, action, reward, next_observation, terminated))
             observation = next_observation
@@ -244,19 +228,17 @@ def record_pearl(
     )
     rng = np.random.default_rng(int(config["seed"]) + 60_000)
     name_prefix = f"{config['env_name']}_pearl_task{args.task_index}"
-    rotate_180 = should_rotate_frames(args.camera_name, args.rotate_180)
+    rotate_180 = args.camera_name in UPSIDE_DOWN_CAMERAS
     for episode in range(adaptation_episodes):
         video_path = args.video_dir / f"{name_prefix}_context_{episode + 1}.mp4"
         episode_return, success = record_pearl_episode(
-            agent, environment, task, previous_episodes, builder, rng, video_path, args.fps, deterministic=False,
-            rotate_180=rotate_180,
+            agent, environment, task, previous_episodes, builder, rng, video_path, args.fps, rotate_180=rotate_180
         )
         print(f"saved {video_path} (context={episode + 1}, return={episode_return:.1f}, success={success})")
 
     video_path = args.video_dir / f"{name_prefix}_adapted.mp4"
     episode_return, success = record_pearl_episode(
-        agent, environment, task, previous_episodes, builder, rng, video_path, args.fps, deterministic=True,
-        rotate_180=rotate_180,
+        agent, environment, task, previous_episodes, builder, rng, video_path, args.fps, rotate_180=rotate_180
     )
     print(f"saved {video_path} (adapted, return={episode_return:.1f}, success={success})")
 
