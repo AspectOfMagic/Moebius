@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import random
+from collections import defaultdict
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
@@ -11,7 +12,8 @@ from torch.utils.tensorboard import SummaryWriter
 
 from moebius.config import TrainConfig
 from moebius.context import AdaptationContextBuffer, ContextBuilder, episode_batch
-from moebius.envs import DynamicsTaskSampler, GoalTaskSampler, MetaWorldSingleTaskEnv, TaskSpec
+from moebius.envs import SHAPES, DynamicsTaskSampler, GoalTaskSampler, MetaWorldSingleTaskEnv, ObjectPropertyBounds, TaskSpec
+from moebius.experts import EXPERT_VARIANTS, expert_variant
 from moebius.pearl import PEARLAgent, context_from_batch
 from moebius.replay_buffer import (
     Batch,
@@ -40,6 +42,13 @@ def parse_args() -> TrainConfig:
     parser.add_argument("--critic-lr", type=float, default=3e-4)
     parser.add_argument("--alpha-lr", type=float, default=3e-4)
     parser.add_argument("--eval-interval", type=int, default=10_000)
+    parser.add_argument(
+        "--max-episode-steps",
+        type=int,
+        default=TrainConfig.max_episode_steps,
+        help="Episode length (at most 500, MetaWorld's limit). Shorter episodes make slow, careful handling "
+        "costly, so the best behavior differs between objects.",
+    )
     parser.add_argument("--log-dir", type=Path, default=Path("runs"))
     parser.add_argument("--checkpoint-dir", type=Path, default=Path("checkpoints"))
     parser.add_argument("--device", default="auto", help="'auto', 'cpu', or a PyTorch device such as 'cuda'.")
@@ -135,6 +144,29 @@ def parse_args() -> TrainConfig:
         "achievable return; set to 0 to disable.",
     )
     parser.add_argument(
+        "--object-shapes",
+        nargs="+",
+        choices=SHAPES,
+        default=list(TrainConfig.object_shapes),
+        help="Object shapes for PEARL dynamics tasks, assigned round-robin to tasks.",
+    )
+    parser.add_argument(
+        "--gripper-force-limit",
+        type=float,
+        default=None,
+        help="Cap on each finger actuator's force in newtons for PEARL dynamics tasks. Without a cap, "
+        "MetaWorld's fingers squeeze far harder than the objects weigh, so mass and friction barely matter. "
+        "Choose a value with moebius-sweep.",
+    )
+    parser.add_argument(
+        "--pearl-expert-variants",
+        nargs="+",
+        choices=tuple(EXPERT_VARIANTS),
+        default=list(TrainConfig.pearl_expert_variants),
+        help="Scripted expert variants tried, in order, when checking that a task is solvable. The first "
+        "variant that solves a task provides its demonstrations, so list the generally strongest first.",
+    )
+    parser.add_argument(
         "--pearl-replay-failed-demos",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -189,7 +221,12 @@ def parse_args() -> TrainConfig:
         "(adaptation_episodes + 1) episodes per task.",
     )
     args = parser.parse_args()
-    return TrainConfig(**vars(args))
+    values = vars(args)
+    if not 1 <= values["max_episode_steps"] <= 500:
+        parser.error("--max-episode-steps must be between 1 and 500 (MetaWorld's episode limit).")
+    values["object_shapes"] = tuple(values["object_shapes"])
+    values["pearl_expert_variants"] = tuple(values["pearl_expert_variants"])
+    return TrainConfig(**values)
 
 
 def set_seed(seed: int) -> None:
@@ -214,15 +251,6 @@ def evaluate(agent: SACAgent, environment: MetaWorldSingleTaskEnv, episodes: int
     return float(np.mean(returns)), float(np.mean(successes))
 
 
-def _pick_place_expert() -> object:
-    """Create the MetaWorld scripted policy used only for Phase 3 demos."""
-    try:
-        from metaworld.policies import SawyerPickPlaceV3Policy
-    except ImportError as error:
-        raise ImportError("MetaWorld's expert policies are required for demonstration-augmented SAC.") from error
-    return SawyerPickPlaceV3Policy()
-
-
 def collect_demonstrations(
     config: TrainConfig,
     observation_dim: int,
@@ -245,7 +273,8 @@ def collect_demonstrations(
     capacity = config.demo_episodes * config.max_episode_steps
     buffer = ReplayBuffer(observation_dim, action_dim, capacity, config.seed + 10_000)
     environment = MetaWorldSingleTaskEnv(config.env_name, config.seed + 2, config.max_episode_steps)
-    expert = _pick_place_expert()
+    # Identical to MetaWorld's SawyerPickPlaceV3Policy.
+    expert = expert_variant("metaworld")
     successful_episodes = 0
     try:
         for episode in range(config.demo_episodes):
@@ -408,18 +437,7 @@ def _pearl_task_sampler(config: TrainConfig) -> GoalTaskSampler | DynamicsTaskSa
         return DynamicsTaskSampler(
             config.num_train_tasks,
             config.num_eval_tasks,
-            object_radius_min=config.object_radius_min,
-            object_radius_max=config.object_radius_max,
-            object_height_min=config.object_height_min,
-            object_height_max=config.object_height_max,
-            object_mass_min=config.object_mass_min,
-            object_mass_max=config.object_mass_max,
-            object_table_friction_min=config.object_table_friction_min,
-            object_table_friction_max=config.object_table_friction_max,
-            object_finger_friction_min=config.object_finger_friction_min,
-            object_finger_friction_max=config.object_finger_friction_max,
-            contact_softness_min=config.contact_softness_min,
-            contact_softness_max=config.contact_softness_max,
+            ObjectPropertyBounds.from_config(asdict(config)),
             seed=config.seed,
         )
     raise ValueError(f"Unsupported PEARL task distribution: {config.pearl_task_distribution}")
@@ -445,12 +463,16 @@ def collect_feasible_dynamics_data(
     action_dim: int,
     writer: SummaryWriter,
 ) -> FeasibleDynamicsData:
-    """Find solvable property vectors and retain their successful rollouts.
+    """Find solvable objects and retain their successful rollouts.
 
-    A candidate must produce ``pearl_demo_episodes_per_task`` successes within
-    ``pearl_demo_max_attempts_per_task`` attempts. Those same trajectories are
-    committed to the demonstration/context buffers, so no second collection
-    pass can fail merely because later resets are less favorable.
+    A candidate object is accepted when any of ``pearl_expert_variants``
+    (tried in order) produces ``pearl_demo_episodes_per_task`` successes within
+    ``pearl_demo_max_attempts_per_task`` attempts. Accepting a task that only a
+    non-default variant solves is what lets objects that need different
+    handling into the task set, and makes the demonstrations task-dependent.
+    The successful trajectories are committed to the demonstration/context
+    buffers, so no second collection pass can fail merely because later
+    resets are less favorable.
     """
     required_successes = config.pearl_demo_episodes_per_task
     max_attempts = config.pearl_demo_max_attempts_per_task
@@ -479,14 +501,23 @@ def collect_feasible_dynamics_data(
         max_sequences_per_task=required_successes,
         seed=config.seed + 30_000,
     )
-    environment = MetaWorldSingleTaskEnv(config.env_name, config.seed + 3, config.max_episode_steps)
-    expert = _pick_place_expert()
+    environment = MetaWorldSingleTaskEnv(
+        config.env_name, config.seed + 3, config.max_episode_steps, gripper_force_limit=config.gripper_force_limit
+    )
+    variants = [(name, expert_variant(name)) for name in config.pearl_expert_variants]
+    if not variants:
+        raise ValueError("pearl_expert_variants must name at least one expert variant.")
+    attempt_counters: dict[tuple[str, int], int] = defaultdict(int)
 
-    def expert_trajectories(task: TaskSpec, split: str) -> tuple[list[Trajectory], list[Trajectory], int]:
-        """Return (successes, failures, attempts) for one property vector."""
+    def expert_trajectories(
+        task: TaskSpec, split: str, expert: object
+    ) -> tuple[list[Trajectory], list[Trajectory], int]:
+        """Return (successes, failures, attempts) for one object and expert variant."""
         trajectories: list[Trajectory] = []
         failures: list[Trajectory] = []
         for attempt in range(1, max_attempts + 1):
+            attempt_counters[(split, task.task_id)] += 1
+            logged_attempt = attempt_counters[(split, task.task_id)]
             observation = _reset_task(environment, task)
             terminated = truncated = False
             episode_return = 0.0
@@ -501,8 +532,8 @@ def collect_feasible_dynamics_data(
                 episode_return += reward
             success = float(info.get("success", False))
             metric_prefix = "demo" if split == "train" else "feasibility"
-            writer.add_scalar(f"{metric_prefix}/{split}_task_{task.task_id}_return", episode_return, attempt)
-            writer.add_scalar(f"{metric_prefix}/{split}_task_{task.task_id}_success", success, attempt)
+            writer.add_scalar(f"{metric_prefix}/{split}_task_{task.task_id}_return", episode_return, logged_attempt)
+            writer.add_scalar(f"{metric_prefix}/{split}_task_{task.task_id}_success", success, logged_attempt)
             if success:
                 trajectories.append(trajectory)
                 if len(trajectories) == required_successes:
@@ -512,19 +543,31 @@ def collect_feasible_dynamics_data(
         return trajectories, failures, max_attempts
 
     failed_trajectories: dict[int, list[Trajectory]] = {}
+    chosen_variants: dict[str, list[str]] = {"train": [], "test": []}
+
+    def solve(task: TaskSpec, split: str) -> tuple[str | None, list[Trajectory], list[Trajectory], int]:
+        """Try the expert variants in order; return the first that succeeds."""
+        all_failures: list[Trajectory] = []
+        for name, expert in variants:
+            trajectories, failures, attempts = expert_trajectories(task, split, expert)
+            all_failures.extend(failures)
+            if len(trajectories) == required_successes:
+                return name, trajectories, all_failures, attempts
+        return None, [], all_failures, 0
 
     def accept_tasks(tasks: tuple[TaskSpec, ...], split: str, retain: bool) -> tuple[TaskSpec, ...]:
         accepted_tasks: list[TaskSpec] = []
         for original_task in tasks:
             candidate = original_task
             for candidate_index in range(1, config.max_property_candidates_per_task + 1):
-                trajectories, failures, attempts = expert_trajectories(candidate, split)
-                if len(trajectories) == required_successes:
+                variant_name, trajectories, failures, attempts = solve(candidate, split)
+                if variant_name is not None:
                     accepted_tasks.append(candidate)
+                    chosen_variants[split].append(f"task {candidate.task_id} ({candidate.shape}): {variant_name}")
                     print(
-                        f"feasibility {split} task={candidate.task_id}: accepted candidate "
-                        f"{candidate_index}/{config.max_property_candidates_per_task} "
-                        f"({required_successes}/{attempts} expert successes)"
+                        f"feasibility {split} task={candidate.task_id} shape={candidate.shape}: accepted candidate "
+                        f"{candidate_index}/{config.max_property_candidates_per_task} with expert "
+                        f"'{variant_name}' ({required_successes}/{attempts} successes)"
                     )
                     if retain:
                         episodes = []
@@ -535,16 +578,17 @@ def collect_feasible_dynamics_data(
                         for offset in range(len(episodes)):
                             contexts.add_sequence(candidate.task_id, episodes[offset:] + episodes[:offset])
                         # Failures of rejected candidates belong to other
-                        # property vectors, so only the accepted one's are kept.
+                        # objects, so only the accepted one's are kept. They
+                        # include failures of every variant tried on it.
                         failed_trajectories[candidate.task_id] = failures
                     writer.add_scalar(f"demo/{split}_task_{candidate.task_id}_attempts", attempts, 0)
                     break
-                candidate = sampler.resample_task(original_task.task_id)
+                candidate = sampler.resample_task(original_task)
             else:
                 raise RuntimeError(
-                    f"Could not find a {split} task with {required_successes} successful expert rollouts after "
-                    f"{config.max_property_candidates_per_task} property candidates. Relax the property bounds or "
-                    "increase max_property_candidates_per_task."
+                    f"Could not find a {split} {original_task.shape} task with {required_successes} successful "
+                    f"expert rollouts after {config.max_property_candidates_per_task} candidates. Relax the property "
+                    "bounds, add expert variants, or increase max_property_candidates_per_task."
                 )
         return tuple(accepted_tasks)
 
@@ -556,6 +600,8 @@ def collect_feasible_dynamics_data(
 
     writer.add_scalar("demo/pearl_transitions", sum(demonstrations.size(task.task_id) for task in sampler.train_tasks), 0)
     writer.add_scalar("demo/pearl_failed_episodes", sum(len(failures) for failures in failed_trajectories.values()), 0)
+    for split, entries in chosen_variants.items():
+        writer.add_text(f"tasks/{split}_expert_variants", "\n\n".join(entries))
     return FeasibleDynamicsData(sampler, demonstrations, contexts, failed_trajectories)
 
 
@@ -733,8 +779,12 @@ def train_pearl(config: TrainConfig) -> None:
         raise ValueError("--meta-batch-size cannot exceed --num-train-tasks.")
     set_seed(config.seed)
     device = "cuda" if config.device == "auto" and torch.cuda.is_available() else ("cpu" if config.device == "auto" else config.device)
-    environment = MetaWorldSingleTaskEnv(config.env_name, config.seed, config.max_episode_steps)
-    evaluation_environment = MetaWorldSingleTaskEnv(config.env_name, config.seed + 1, config.max_episode_steps)
+    environment = MetaWorldSingleTaskEnv(
+        config.env_name, config.seed, config.max_episode_steps, gripper_force_limit=config.gripper_force_limit
+    )
+    evaluation_environment = MetaWorldSingleTaskEnv(
+        config.env_name, config.seed + 1, config.max_episode_steps, gripper_force_limit=config.gripper_force_limit
+    )
     task_sampler = _pearl_task_sampler(config)
     observation_dim = int(np.prod(environment.observation_space.shape))
     action_dim = int(np.prod(environment.action_space.shape))
@@ -932,8 +982,9 @@ def train_pearl(config: TrainConfig) -> None:
                 )
                 writer.add_scalar("eval/success_mean", float(evaluation.successes.mean()), step)
                 writer.add_scalar("eval/episodes_per_step", evaluation.episodes_per_step, step)
-                for task, task_success in zip(task_sampler.test_tasks, evaluation.task_successes, strict=True):
-                    writer.add_scalar(f"eval_task/task_{task.task_id}_success", task_success, step)
+                # Not "task": that name is the training loop's current task.
+                for test_task, task_success in zip(task_sampler.test_tasks, evaluation.task_successes, strict=True):
+                    writer.add_scalar(f"eval_task/task_{test_task.task_id}_success", task_success, step)
                 for adaptation_step in range(config.adaptation_episodes + 1):
                     writer.add_scalar(
                         f"eval/return_after_context_{adaptation_step}", evaluation.returns[adaptation_step], step

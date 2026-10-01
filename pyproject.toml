@@ -23,6 +23,7 @@ dev = ["pytest>=8.0"]
 [project.scripts]
 moebius-record = "moebius.record:main"
 moebius-train = "moebius.train:main"
+moebius-sweep = "moebius.sweep:main"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

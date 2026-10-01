@@ -36,23 +36,40 @@ class TrainConfig:
     bc_weight: float = 1.0
     bc_decay_steps: int = 250_000
     pearl_task_distribution: str = "dynamics"
-    # Bounds for PEARL's hidden object-property distribution. These deliberately
-    # live in configuration rather than the CLI: they define the experiment's
-    # task family and must be saved with the checkpoint.
-    object_radius_min: float = 0.015
-    object_radius_max: float = 0.025
-    object_height_min: float = 0.025
-    object_height_max: float = 0.055
-    object_mass_min: float = 0.25
-    object_mass_max: float = 1.25
-    object_table_friction_min: float = 0.25
-    object_table_friction_max: float = 2.00
-    object_finger_friction_min: float = 1.00
-    object_finger_friction_max: float = 3.00
-    # MuJoCo solref's positive time-constant parameter: higher values create
-    # softer contacts. The lower bound remains above the simulation timestep.
-    contact_softness_min: float = 0.008
-    contact_softness_max: float = 0.060
+    # PEARL dynamics tasks: object shape, size and hidden physical properties.
+    # Bounds deliberately live in configuration rather than the CLI: they
+    # define the experiment's task family and are saved with the checkpoint.
+    # Shapes are assigned round-robin; spheres use half_width as the radius
+    # and only bars use the half-length range (their half-extent along x).
+    # Spheres are left out by default: the sweep found them solvable only about
+    # half the time by any expert variant, adding difficulty but no contrast.
+    object_shapes: tuple[str, ...] = ("cylinder", "box", "bar")
+    object_half_width_min: float = 0.015
+    object_half_width_max: float = 0.025
+    object_half_height_min: float = 0.015
+    object_half_height_max: float = 0.03
+    object_bar_half_length_min: float = 0.04
+    object_bar_half_length_max: float = 0.07
+    # Hidden properties. Mass with finger friction decides whether a grasp
+    # slips; low table friction makes the object slide or roll when touched.
+    object_mass_min: float = 0.1
+    # Capped at 1.2 kg: with a 60 N gripper limit, 2 kg objects were mostly
+    # unsolvable by every expert variant.
+    object_mass_max: float = 1.2
+    object_table_friction_min: float = 0.05
+    object_table_friction_max: float = 1.5
+    object_finger_friction_min: float = 0.3
+    object_finger_friction_max: float = 2.0
+    # Newtons per finger; None keeps MetaWorld's unlimited servo, under which
+    # mass and friction barely affect the grasp. Pick a value with
+    # moebius-sweep.
+    gripper_force_limit: float | None = None
+    # Scripted expert variants tried, in order, by the feasibility check.
+    # The first variant that solves a task provides its demonstrations, so the
+    # generally strongest variant comes first. Under a force limit and short
+    # episodes the sweep found careful best for boxes and bars and
+    # slow_transport best for cylinders.
+    pearl_expert_variants: tuple[str, ...] = ("careful", "slow_transport", "low_grasp", "metaworld")
     # Number of distinct property vectors tried when finding one that can
     # yield the requested expert demonstrations.
     max_property_candidates_per_task: int = 25

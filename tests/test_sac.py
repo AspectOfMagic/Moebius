@@ -1,8 +1,12 @@
+from dataclasses import asdict
+
 import numpy as np
+import pytest
 import torch
 
 from moebius.config import TrainConfig
-from moebius.envs import DynamicsTaskSampler, GoalTaskSampler
+from moebius.envs import SHAPES, DynamicsTaskSampler, GoalTaskSampler, ObjectPropertyBounds, TaskSpec, object_geometry
+from moebius.experts import EXPERT_VARIANTS
 from moebius.networks import ContextEncoder
 from moebius.pearl import PEARLAgent, context_from_batch, context_transition
 from moebius.networks import SquashedGaussianActor
@@ -45,73 +49,110 @@ def test_phase_three_defaults_to_pick_and_place_with_disjoint_task_configs() -> 
     )
 
 
-def test_dynamics_tasks_hide_disjoint_diverse_object_property_vectors() -> None:
-    sampler = DynamicsTaskSampler(
-        3,
-        2,
-        object_radius_min=0.01,
-        object_radius_max=0.02,
-        object_height_min=0.02,
-        object_height_max=0.04,
-        object_mass_min=0.2,
-        object_mass_max=1.0,
-        object_table_friction_min=0.1,
-        object_table_friction_max=1.0,
-        object_finger_friction_min=0.2,
-        object_finger_friction_max=2.0,
-        contact_softness_min=0.005,
-        contact_softness_max=0.02,
-        seed=9,
+def test_dynamics_tasks_cycle_shapes_and_respect_bounds() -> None:
+    bounds = ObjectPropertyBounds(
+        half_width=(0.01, 0.02),
+        half_height=(0.02, 0.03),
+        bar_half_length=(0.05, 0.06),
+        mass=(0.2, 1.0),
+        table_friction=(0.1, 1.0),
+        finger_friction=(0.2, 2.0),
     )
-    train_parameters = {
-        (
-            task.object_radius,
-            task.object_height,
-            task.object_mass,
-            task.object_table_friction,
-            task.object_finger_friction,
-            task.contact_softness,
-        )
-        for task in sampler.train_tasks
+    sampler = DynamicsTaskSampler(6, 4, bounds, seed=9)
+    tasks = sampler.train_tasks + sampler.test_tasks
+
+    assert [task.shape for task in sampler.train_tasks] == list(SHAPES) + list(SHAPES[:2])
+    assert [task.shape for task in sampler.test_tasks] == list(SHAPES)
+    assert all(task.reset_seed is None for task in tasks)
+    for task in tasks:
+        assert 0.01 <= task.object_half_width <= 0.02
+        assert 0.2 <= task.object_mass <= 1.0
+        assert 0.1 <= task.object_table_friction <= 1.0
+        assert 0.2 <= task.object_finger_friction <= 2.0
+        if task.shape == "sphere":
+            assert task.object_half_height == task.object_half_width
+        else:
+            assert 0.02 <= task.object_half_height <= 0.03
+        assert (task.object_half_length is not None) == (task.shape == "bar")
+        if task.shape == "bar":
+            assert 0.05 <= task.object_half_length <= 0.06
+    train_masses = {task.object_mass for task in sampler.train_tasks}
+    assert train_masses.isdisjoint(task.object_mass for task in sampler.test_tasks)
+
+
+def test_dynamics_task_resampling_preserves_task_id_and_shape() -> None:
+    sampler = DynamicsTaskSampler(4, 1, seed=4)
+    original = sampler.train_tasks[3]
+
+    replacement = sampler.resample_task(original)
+
+    assert replacement.task_id == original.task_id
+    assert replacement.shape == original.shape
+    assert replacement != original
+
+
+def test_object_geometry_sizes_and_inertia() -> None:
+    cylinder = object_geometry("cylinder", 0.02, 0.03, None, 1.0)
+    assert cylinder.size == (0.02, 0.03, 0.0)
+    assert cylinder.rest_height == 0.03 and cylinder.grip_half_width == 0.02
+    assert np.isclose(cylinder.inertia[0], (3 * 0.02**2 + 4 * 0.03**2) / 12)
+    assert np.isclose(cylinder.inertia[2], 0.02**2 / 2)
+
+    sphere = object_geometry("sphere", 0.02, 0.5, None, 2.0)
+    assert sphere.size[0] == 0.02 and sphere.rest_height == 0.02 and sphere.bounding_radius == 0.02
+    assert np.allclose(sphere.inertia, 2 * 2.0 * 0.02**2 / 5)
+
+    bar = object_geometry("bar", 0.02, 0.01, 0.06, 3.0)
+    assert bar.half_extents == (0.06, 0.02, 0.01)
+    assert bar.grip_half_width == 0.02 and bar.rest_height == 0.01
+    # Box inertia about x uses the y and z half-extents: m (hy^2 + hz^2) / 3.
+    assert np.isclose(bar.inertia[0], 3.0 * (0.02**2 + 0.01**2) / 3)
+    assert np.isclose(bar.bounding_radius, np.linalg.norm((0.06, 0.02, 0.01)))
+
+    box = object_geometry("box", 0.02, 0.01, 0.5, 1.0)
+    assert box.half_extents == (0.02, 0.02, 0.01)  # half_length only applies to bars
+
+
+def test_legacy_cylinder_tasks_convert_to_shaped_tasks() -> None:
+    legacy = {
+        "task_id": 3,
+        "reset_seed": None,
+        "object_radius": 0.02,
+        "object_height": 0.05,
+        "object_mass": 0.5,
+        "object_table_friction": 1.0,
+        "object_finger_friction": 2.0,
+        "contact_softness": 0.02,
     }
-    test_parameters = {
-        (
-            task.object_radius,
-            task.object_height,
-            task.object_mass,
-            task.object_table_friction,
-            task.object_finger_friction,
-            task.contact_softness,
-        )
-        for task in sampler.test_tasks
-    }
 
-    assert train_parameters.isdisjoint(test_parameters)
-    assert all(task.reset_seed is None for task in sampler.train_tasks + sampler.test_tasks)
-    assert all(
-        0.01 <= radius <= 0.02
-        and 0.02 <= height <= 0.04
-        and 0.2 <= mass <= 1.0
-        and 0.1 <= table_friction <= 1.0
-        and 0.2 <= finger_friction <= 2.0
-        and 0.005 <= softness <= 0.02
-        for radius, height, mass, table_friction, finger_friction, softness in train_parameters | test_parameters
-    )
+    task = TaskSpec.from_dict(legacy)
+
+    assert task.shape == "cylinder"
+    assert task.object_half_width == 0.02 and task.object_half_height == 0.025
+    assert task.object_mass == 0.5 and task.object_half_length is None
+    assert TaskSpec.from_dict({"task_id": 1, "reset_seed": 5}) == TaskSpec(1, 5)
 
 
-def test_dynamics_task_resampling_preserves_task_id_and_bounds() -> None:
-    sampler = DynamicsTaskSampler(1, 1, object_radius_min=0.01, object_radius_max=0.02, seed=4)
+def test_property_bounds_read_from_config() -> None:
+    config = asdict(TrainConfig(object_mass_min=0.3, object_shapes=("sphere", "bar")))
+    bounds = ObjectPropertyBounds.from_config(config)
+    assert bounds.mass == (0.3, TrainConfig().object_mass_max)
+    assert bounds.shapes == ("sphere", "bar")
+    # Missing keys (older checkpoints) fall back to the defaults.
+    assert ObjectPropertyBounds.from_config({}) == ObjectPropertyBounds()
 
-    replacement = sampler.resample_task(task_id=17)
 
-    assert replacement.task_id == 17
-    assert replacement.reset_seed is None
-    assert 0.01 <= replacement.object_radius <= 0.02
-    assert replacement.object_height is not None
-    assert replacement.object_mass is not None
-    assert replacement.object_table_friction is not None
-    assert replacement.object_finger_friction is not None
-    assert replacement.contact_softness is not None
+def test_default_expert_matches_metaworld_policy() -> None:
+    policies = pytest.importorskip("metaworld.policies")
+    reference = policies.SawyerPickPlaceV3Policy()
+    expert = EXPERT_VARIANTS["metaworld"]
+    rng = np.random.default_rng(0)
+    for _ in range(200):
+        observation = rng.uniform(-0.2, 0.2, 39)
+        observation[4:7] = observation[:3] + rng.normal(0, 0.05, 3)  # hand near the object
+        observation[3] = rng.uniform(0, 1)
+        expected = np.clip(reference.get_action(observation), -1, 1)
+        assert np.allclose(expert.get_action(observation), expected, atol=1e-6)
 
 
 def _episode(start: float, steps: int, observation_dim: int = 8, moving: bool = False) -> Batch:
@@ -526,3 +567,19 @@ def test_pearl_evaluation_uses_mean_actions_and_sampled_latents_at_every_step() 
     assert evaluation.episodes_per_step == 6
     assert np.allclose(evaluation.successes, 1.0) and np.allclose(evaluation.task_successes, 1.0)
     assert np.allclose(evaluation.returns, episode_length)
+
+
+def test_low_grasp_stops_descending_at_the_hand_floor() -> None:
+    """MetaWorld clamps the hand at z = 0.05, below which a grasp target is unreachable."""
+    observation = np.zeros(39)
+    observation[:3] = (0.0, 0.6, 0.052)  # hand at the floor, above the object
+    observation[3] = observation[21] = 0.9  # gripper still open
+    observation[4:7] = (0.005, 0.6, 0.02)
+    observation[36:39] = (0.1, 0.8, 0.2)
+
+    waiting = EXPERT_VARIANTS["low_grasp"].get_action(observation)
+    observation[3] = observation[21] = 0.5  # gripper closed on the object
+    carrying = EXPERT_VARIANTS["low_grasp"].get_action(observation)
+
+    assert np.allclose(waiting[:3], 0.0) and waiting[3] == 1.0
+    assert np.all(carrying[:3] > 0)

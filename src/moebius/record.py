@@ -8,7 +8,7 @@ import imageio.v2 as imageio
 import numpy as np
 import torch
 
-from moebius.envs import DynamicsTaskSampler, GoalTaskSampler, MetaWorldSingleTaskEnv, TaskSpec
+from moebius.envs import DynamicsTaskSampler, GoalTaskSampler, MetaWorldSingleTaskEnv, ObjectPropertyBounds, TaskSpec
 from moebius.networks import SquashedGaussianActor
 from moebius.context import ContextBuilder, episode_batch
 from moebius.pearl import PEARLAgent
@@ -184,23 +184,13 @@ def record_pearl(
     task_specs: dict[str, list[dict[str, Any]]] | None = None,
 ) -> None:
     if task_specs is not None:
-        test_tasks = tuple(TaskSpec(**task) for task in task_specs["test"])
+        # from_dict also converts tasks saved before object shapes existed.
+        test_tasks = tuple(TaskSpec.from_dict(task) for task in task_specs["test"])
     elif config.get("pearl_task_distribution", "goal") == "dynamics":
         sampler = DynamicsTaskSampler(
-            num_train_tasks=int(config["num_train_tasks"]),
-            num_test_tasks=int(config["num_eval_tasks"]),
-            object_radius_min=float(config.get("object_radius_min", 0.008)),
-            object_radius_max=float(config.get("object_radius_max", 0.028)),
-            object_height_min=float(config.get("object_height_min", 0.016)),
-            object_height_max=float(config.get("object_height_max", 0.080)),
-            object_mass_min=float(config.get("object_mass_min", 0.10)),
-            object_mass_max=float(config.get("object_mass_max", 2.00)),
-            object_table_friction_min=float(config.get("object_table_friction_min", 0.05)),
-            object_table_friction_max=float(config.get("object_table_friction_max", 4.00)),
-            object_finger_friction_min=float(config.get("object_finger_friction_min", 0.05)),
-            object_finger_friction_max=float(config.get("object_finger_friction_max", 4.00)),
-            contact_softness_min=float(config.get("contact_softness_min", 0.004)),
-            contact_softness_max=float(config.get("contact_softness_max", 0.060)),
+            int(config["num_train_tasks"]),
+            int(config["num_eval_tasks"]),
+            ObjectPropertyBounds.from_config(config),
             seed=int(config["seed"]),
         )
         test_tasks = sampler.test_tasks
@@ -261,6 +251,7 @@ def record(args: argparse.Namespace) -> None:
         max_episode_steps=int(config["max_episode_steps"]),
         render_mode="rgb_array",
         camera_name=args.camera_name,
+        gripper_force_limit=config.get("gripper_force_limit"),
     )
     args.video_dir.mkdir(parents=True, exist_ok=True)
 

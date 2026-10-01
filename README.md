@@ -3,7 +3,7 @@
 State-based reinforcement-learning experiments for robot manipulation. Phase 1
 is a Soft Actor-Critic (SAC) baseline, Phase 2 adds PEARL latent-task
 inference, Phase 3 applies that pipeline to MetaWorld pick-and-place, and
-Phase 4 introduces hidden object properties.
+Phase 4 introduces object shapes and hidden object properties.
 
 
 ## Included in Phase 1
@@ -40,18 +40,30 @@ Phase 4 introduces hidden object properties.
   across the training reset distribution, behavior-clone the actor, then mix
   permanent demonstrations with online experience during SAC updates.
 
-## Included in Phase 4 — Hidden object properties
+## Included in Phase 4 — Object shapes and hidden properties
 
-- Each PEARL task fixes an unobserved cylinder radius, height, mass,
-  object/table friction, object/finger friction, and contact softness. The
-  default bounds are deliberately broad and stored in `TrainConfig`, with
-  independently sampled and disjoint train/test property vectors.
-- Before training, each candidate property vector must yield
+- Each PEARL task picks an object shape (cylinder, box, bar or sphere,
+  assigned round-robin so every shape is in both the train and test sets), a
+  size, and three hidden properties: mass, finger friction and table
+  friction. Mass together with finger friction decides whether a grasp slips;
+  low table friction makes the object slide or roll away when touched. All
+  shapes rest with the same orientation, so the observed object orientation
+  does not reveal the shape. Bounds live in `TrainConfig`.
+- The shape is swapped inside MetaWorld's pick-place model (MuJoCo primitive
+  geoms can change type and size in place), so there is one environment and
+  no modified copies of MetaWorld's scene files.
+- MetaWorld's finger actuators are position servos with no force limit, so
+  they squeeze far harder than any of these objects weigh and mass and
+  friction barely affect the grasp. `--gripper-force-limit` caps each finger's
+  force (a robot constant, not a task property). Use `moebius-sweep` to choose
+  a value.
+- Before training, each candidate object must yield
   `pearl_demo_episodes_per_task` successful scripted rollouts within
-  `pearl_demo_max_attempts_per_task` attempts. Candidates that fail are
-  resampled; successful training rollouts are retained directly as the PEARL
-  demonstration buffer. The exact accepted train/test vectors are saved in the
-  checkpoint.
+  `pearl_demo_max_attempts_per_task` attempts, from any of the expert variants
+  in `--pearl-expert-variants` (tried in order; `metaworld` is MetaWorld's own
+  scripted policy). Candidates that no variant solves are resampled with the
+  same shape. The exact accepted tasks and the variant that solved each are
+  saved in the checkpoint and the `tasks/*` TensorBoard text entries.
 - Object and goal positions are still randomized on every reset within each
   task. This ensures that PEARL must infer dynamics from transitions rather
   than using a visible configuration as a task label.
@@ -116,8 +128,8 @@ rule (`PEARLAgent.latent_for_episode` and `moebius.context.ContextBuilder`):
   earlier episodes on that task, not just the tail of the last one.
 - Up to `--context-motion-fraction` (default 0.75) of the `--context-size`
   (default 64) transitions are ones where the object moved more than
-  `--context-motion-threshold` (default 1 mm) in a step. Hidden mass,
-  friction and softness only show up while the object is being handled.
+  `--context-motion-threshold` (default 1 mm) in a step. Hidden mass
+  and friction only show up while the object is being handled.
   Motion is read from the observation, so nothing hidden is used.
 - Training samples `k` from 0 to `--adaptation-episodes` and builds each
   task's context from the first `k` episodes of one of its
@@ -175,12 +187,43 @@ To retain the original pure-SAC baseline, disable demonstrations explicitly:
 moebius-train --algorithm sac --total-steps 1000000 --demo-episodes 0
 ```
 
-## Train PEARL with hidden object properties
+## Check that objects call for different behavior
 
-Each task samples a hidden cylinder radius, height, mass, object/table
-friction, object/finger friction, and contact softness. The intentionally wide
-bounds are stored in `TrainConfig`, rather than exposed as training-command
-flags, so they remain part of each experiment's saved configuration. Object
+Before training, run the sweep. For each gripper force limit, it tries every
+expert variant on every shape at low/middle/high mass and finger friction and
+low/high table friction, then reports the *adaptation gap*: success when the
+best variant is picked for each object, minus success of the best single
+variant. A gap near zero means one fixed behavior handles every object and
+PEARL's latent has nothing to add. Read the *held-out* gap: variants are
+chosen on half of the episodes and scored on the other half. The in-sample
+gap picks the best of several noisy estimates and is positive even when no
+real difference exists. Use `--episodes 4` or more. The sweep also prints the
+measured grip force.
+
+```bash
+pip install -e .   # registers the moebius-sweep command
+moebius-sweep --force-limits none 40 --episodes 4           # quick first pass
+moebius-sweep --force-limits 60 --masses 0.1 0.6 1.2 --max-steps 500 200 150 --episodes 4   # time pressure
+moebius-sweep --episodes 5 --output runs/sweep_full.csv     # full grid
+```
+
+`--max-steps` evaluates several episode lengths from the same episodes
+(each runs once at the longest length; success is read at every shorter one).
+With 500 steps, slow and careful handling costs nothing, so one careful
+behavior tends to win everywhere; shorter episodes make it costly on easy
+objects, which is what can make the best behavior differ between objects.
+
+The full default grid is 4 force limits x 72 objects x 4 variants x 3
+episodes, about an hour on a laptop. Pick the force limit with the largest
+gap at which most objects are still solvable, and pass it to training as
+`--gripper-force-limit`.
+
+## Train PEARL with object shapes and hidden properties
+
+Each task samples a shape, a size and hidden mass, finger friction and table
+friction. The bounds are stored in `TrainConfig`, rather than exposed as
+training-command flags, so they remain part of each experiment's saved
+configuration. Object
 and goal positions are randomized per reset; PEARL must infer task properties
 from `(s, a, r, s')` transitions. Expert demonstrations are restricted to
 training tasks; held-out dynamics are never added to a buffer.
@@ -194,8 +237,17 @@ moebius-train --algorithm pearl --pearl-task-distribution dynamics \
   --demo-batch-fraction 0.25 --bc-weight 1.0 --bc-decay-steps 500000 \
   --pearl-bc-weight-floor 0.2 --context-sequences-per-task 4 \
   --pearl-reward-scale 0.1 --pearl-initial-alpha 0.02 \
+  --gripper-force-limit 60 --max-episode-steps 150 \
+  --pearl-eval-sequences-per-task 3 --eval-interval 30000 \
   --total-steps 1000000
 ```
+
+The 60 N force limit and 150-step episodes come from the sweep: under them,
+the careful expert is best for boxes and bars, while slow transport with
+MetaWorld's higher grasp is best for cylinders (54% vs 15%), and neither shape
+can be told apart before contact. Defaults leave out spheres and cap mass at
+1.2 kg, because the sweep found those objects mostly unsolvable by every
+expert variant.
 
 Set `--pearl-demo-episodes-per-task 0` to run the original random-exploration
 PEARL variant. TensorBoard logs `demo/pearl_*`, `pretrain/pearl_bc_loss`,
