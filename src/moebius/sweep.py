@@ -59,15 +59,21 @@ def parse_args() -> argparse.Namespace:
 
 def run_episode(
     environment: MetaWorldSingleTaskEnv, expert: PickPlaceExpert, lengths: list[int]
-) -> tuple[dict[int, bool], float]:
-    """Return ({length: success at that step}, mean pad-object normal force while gripping).
+) -> tuple[dict[int, bool], float, float]:
+    """Return ({length: success at that step}, mean grip force, mean lift force).
 
     Success at step ``length`` is what an episode truncated at ``length``
-    would report as its final-step success.
+    would report as its final-step success. The grip force is the pad-object
+    normal force while gripping; the lift force is the vertical force from
+    the fingers on the object while it is at least 2 cm above its start
+    (about mass x 9.81 N when held steadily). Both are in newtons, 0 if never
+    gripped or lifted.
     """
     observation, _ = environment.reset()
+    start_height = observation[6]
     terminated = truncated = False
     forces = []
+    lift_forces = []
     success_at: dict[int, bool] = {}
     step = 0
     while not (terminated or truncated):
@@ -75,10 +81,16 @@ def run_episode(
         step += 1
         if step in lengths:
             success_at[step] = bool(info.get("success", False))
-        force = environment.grip_force()
+        finger_force, _, force = environment._object_contact_forces()
         if force > 0:
             forces.append(force)
-    return success_at, float(np.mean(forces)) if forces else 0.0
+        if observation[6] > start_height + 0.02:
+            lift_forces.append(finger_force[2])
+    return (
+        success_at,
+        float(np.mean(forces)) if forces else 0.0,
+        float(np.mean(lift_forces)) if lift_forces else 0.0,
+    )
 
 
 def sweep(args: argparse.Namespace) -> list[dict[str, object]]:
@@ -93,7 +105,12 @@ def sweep(args: argparse.Namespace) -> list[dict[str, object]]:
     rows: list[dict[str, object]] = []
     for force_limit in force_limits:
         environment = MetaWorldSingleTaskEnv(
-            "pick-place-v3", args.seed, max_episode_steps=lengths[-1], gripper_force_limit=force_limit
+            "pick-place-v3",
+            args.seed,
+            max_episode_steps=lengths[-1],
+            gripper_force_limit=force_limit,
+            # As in training; the experts' full grip (1.0) is unchanged by it.
+            gripper_force_control=force_limit is not None,
         )
         try:
             grid = itertools.product(args.shapes, args.masses, args.finger_frictions, args.table_frictions)
@@ -113,10 +130,11 @@ def sweep(args: argparse.Namespace) -> list[dict[str, object]]:
                     results = [
                         run_episode(environment, EXPERT_VARIANTS[variant], lengths) for _ in range(args.episodes)
                     ]
-                    grip_forces = [force for _, force in results if force > 0]
+                    grip_forces = [result[1] for result in results if result[1] > 0]
+                    lift_forces = [result[2] for result in results if result[2] != 0]
                     half = args.episodes // 2
                     for length in lengths:
-                        outcomes = [success_at[length] for success_at, _ in results]
+                        outcomes = [result[0][length] for result in results]
                         row = {
                             "force_limit": "none" if force_limit is None else force_limit,
                             "max_steps": length,
@@ -131,6 +149,7 @@ def sweep(args: argparse.Namespace) -> list[dict[str, object]]:
                             "first_half_successes": sum(outcomes[:half]),
                             "first_half_episodes": half,
                             "mean_grip_force": float(np.mean(grip_forces)) if grip_forces else 0.0,
+                            "mean_lift_force": float(np.mean(lift_forces)) if lift_forces else 0.0,
                         }
                         rows.append(row)
                     print(
@@ -139,7 +158,7 @@ def sweep(args: argparse.Namespace) -> list[dict[str, object]]:
                         + " ".join(
                             f"{length} steps {sum(r[0][length] for r in results)}/{args.episodes}" for length in lengths
                         )
-                        + f" grip={row['mean_grip_force']:.1f} N",
+                        + f" grip={row['mean_grip_force']:.1f} N lift={row['mean_lift_force']:.1f} N",
                         flush=True,
                     )
         finally:
@@ -213,6 +232,16 @@ def summarize(rows: list[dict[str, object]]) -> None:
                 f"HELD-OUT ADAPTATION GAP: {gap:+.0%} (per-object choice {per_object:.0%} vs single best "
                 f"{single:.0%}; near 0 = one behavior handles every object)"
             )
+        masses = sorted({row["mass"] for row in force_rows})
+        print("  mean lift force by mass (contact observation; ~ mass x 9.81 N if mass is visible): " + ", ".join(
+            f"{mass:g} kg: "
+            + (
+                f"{np.mean(lifted):.1f} N"
+                if (lifted := [r["mean_lift_force"] for r in force_rows if r["mass"] == mass and r["mean_lift_force"]])
+                else "never lifted"
+            )
+            for mass in masses
+        ))
         for index, name in enumerate(("shape", "mass", "finger friction", "table friction")):
             levels = sorted({key[index] for key in rate}, key=str)
             summary = ", ".join(

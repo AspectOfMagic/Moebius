@@ -1,12 +1,20 @@
-from dataclasses import asdict
+from dataclasses import asdict, replace
 
 import numpy as np
 import pytest
 import torch
 
 from moebius.config import TrainConfig
-from moebius.envs import SHAPES, DynamicsTaskSampler, GoalTaskSampler, ObjectPropertyBounds, TaskSpec, object_geometry
-from moebius.experts import EXPERT_VARIANTS
+from moebius.envs import (
+    SHAPES,
+    SHAPE_ENVIRONMENTS,
+    DynamicsTaskSampler,
+    GoalTaskSampler,
+    ObjectPropertyBounds,
+    TaskSpec,
+    object_geometry,
+)
+from moebius.experts import EXPERT_VARIANTS, dedicated_expert
 from moebius.networks import ContextEncoder
 from moebius.pearl import PEARLAgent, context_from_batch, context_transition
 from moebius.networks import SquashedGaussianActor
@@ -21,7 +29,10 @@ from moebius.replay_buffer import (
 )
 from moebius.sac import SACAgent
 from moebius.train import (
+    demonstration_expert,
     demonstration_batch_sizes,
+    grip_band_for_task,
+    lowest_reliable_grip,
     evaluate_pearl,
     online_bc_weight,
     pearl_online_bc_weight,
@@ -40,6 +51,9 @@ def test_actor_respects_action_bounds() -> None:
 
 def test_phase_three_defaults_to_pick_and_place_with_disjoint_task_configs() -> None:
     assert TrainConfig().env_name == "pick-place-v3"
+    assert TrainConfig().pearl_env_names == SHAPE_ENVIRONMENTS
+    assert TrainConfig().pearl_decoder_weight == 0.0
+    assert not TrainConfig().pearl_vary_object_dynamics
     sampler = GoalTaskSampler(num_train_tasks=3, num_test_tasks=2, seed=7)
 
     assert len(sampler.train_tasks) == 3
@@ -89,6 +103,30 @@ def test_dynamics_task_resampling_preserves_task_id_and_shape() -> None:
     assert replacement.task_id == original.task_id
     assert replacement.shape == original.shape
     assert replacement != original
+
+
+def test_shape_only_tasks_cover_environments_without_randomizing_dynamics() -> None:
+    sampler = DynamicsTaskSampler(
+        8,
+        4,
+        ObjectPropertyBounds(shapes=("cylinder", "box")),
+        seed=4,
+        env_names=SHAPE_ENVIRONMENTS,
+        vary_dynamics=False,
+    )
+
+    assert [task.env_name for task in sampler.test_tasks] == list(SHAPE_ENVIRONMENTS)
+    assert [task.shape for task in sampler.train_tasks[:4]] == ["cylinder"] * 4
+    assert [task.shape for task in sampler.train_tasks[4:]] == ["box"] * 4
+    assert all(task.object_mass is None for task in sampler.train_tasks + sampler.test_tasks)
+    assert all(task.object_table_friction is None for task in sampler.train_tasks + sampler.test_tasks)
+    assert all(task.object_finger_friction is None for task in sampler.train_tasks + sampler.test_tasks)
+    assert {type(dedicated_expert(name)).__name__ for name in SHAPE_ENVIRONMENTS} == {
+        "SawyerPickPlaceV3Policy",
+        "SawyerPickPlaceWallV3Policy",
+        "SawyerShelfPlaceV3Policy",
+        "SawyerPickOutOfHoleV3Policy",
+    }
 
 
 def test_object_geometry_sizes_and_inertia() -> None:
@@ -142,6 +180,244 @@ def test_property_bounds_read_from_config() -> None:
     assert ObjectPropertyBounds.from_config({}) == ObjectPropertyBounds()
 
 
+def test_grip_effort_only_changes_the_grip_command() -> None:
+    observation = np.zeros(39)
+    observation[:3] = observation[4:7] = (0.0, 0.6, 0.05)  # hand at the object
+    observation[3] = 0.5
+    careful = EXPERT_VARIANTS["careful"]
+    gentle = replace(careful, grip_effort=0.35)
+    assert careful.get_action(observation)[3] == 1.0
+    assert gentle.get_action(observation)[3] == pytest.approx(0.35)
+    assert np.allclose(gentle.get_action(observation)[:3], careful.get_action(observation)[:3])
+    observation[4:7] = (0.1, 0.7, 0.02)  # object far away: open
+    assert careful.get_action(observation)[3] == -1.0
+    assert EXPERT_VARIANTS["metaworld"].get_action(observation)[3] == 0.0  # MetaWorld parity
+
+
+def test_force_control_demonstrations_use_one_full_grip_target() -> None:
+    gentle = replace(EXPERT_VARIANTS["careful"], grip_effort=0.23)
+    assert demonstration_expert(gentle, gripper_force_control=True).grip_effort == 1.0
+    assert demonstration_expert(gentle, gripper_force_control=False) is gentle
+
+
+def test_lowest_reliable_grip_picks_the_first_level_with_four_of_five_successes() -> None:
+    calls = []
+
+    def succeeds(level: float, attempt: int) -> bool:
+        calls.append((level, attempt))
+        return level >= 0.35
+
+    assert lowest_reliable_grip(succeeds, (0.1, 0.2, 0.35, 0.5)) == 0.35
+    # Failing levels are abandoned after two failures; the reliable one stops at four successes.
+    assert calls == [
+        (0.1, 0),
+        (0.1, 1),
+        (0.2, 0),
+        (0.2, 1),
+        (0.35, 0),
+        (0.35, 1),
+        (0.35, 2),
+        (0.35, 3),
+    ]
+    assert lowest_reliable_grip(lambda level, attempt: False, (0.1, 0.2)) is None
+
+
+def test_grip_bands_are_balanced_without_being_tied_to_shape() -> None:
+    assignments = [grip_band_for_task(task_id, len(TrainConfig.object_shapes))[0] for task_id in range(18)]
+    assert assignments.count("gentle") == 6
+    assert assignments.count("medium") == 6
+    assert assignments.count("strong") == 6
+    # Two complete nine-task cycles cover every shape/band pair twice.
+    pairs = [(TrainConfig.object_shapes[i % 3], assignments[i]) for i in range(18)]
+    assert len(set(pairs)) == 9
+    assert all(assignments[i] != "strong" or grip_band_for_task(i, 3)[1] == frozenset((0.8,)) for i in range(18))
+
+
+def test_grip_penalty_charges_only_for_squeezing_beyond_the_calibrated_grip() -> None:
+    pytest.importorskip("metaworld")
+    from moebius.envs import MetaWorldSingleTaskEnv
+
+    environment = MetaWorldSingleTaskEnv(
+        "pick-place-v3",
+        seed=0,
+        max_episode_steps=120,
+        gripper_force_limit=60.0,
+        gripper_force_control=True,
+        grip_penalty=1.0,
+    )
+    task = TaskSpec(
+        0,
+        shape="box",
+        object_half_width=0.02,
+        object_half_height=0.02,
+        object_mass=0.2,
+        object_table_friction=1.0,
+        object_finger_friction=1.0,
+    )
+
+    def total_penalty(task: TaskSpec, expert) -> float:
+        environment.set_task_properties(task)
+        observation, _ = environment.reset()
+        total, terminated, truncated = 0.0, False, False
+        while not (terminated or truncated):
+            observation, _, terminated, truncated, info = environment.step(expert.get_action(observation))
+            total += info["grip_penalty"]
+        return total
+
+    try:
+        careful = EXPERT_VARIANTS["careful"]
+        calibrated = replace(task, object_grip_effort=0.2)
+        assert total_penalty(task, careful) == 0.0  # no calibrated grip: no penalty
+        full_grip = total_penalty(calibrated, careful)
+        assert full_grip > 0.0
+        assert total_penalty(calibrated, replace(careful, grip_effort=0.2)) < 0.2 * full_grip
+    finally:
+        environment.close()
+
+
+def test_force_control_dense_reward_uses_the_continuous_effort() -> None:
+    pytest.importorskip("metaworld")
+    from moebius.envs import MetaWorldSingleTaskEnv
+
+    environment = MetaWorldSingleTaskEnv(
+        "pick-place-v3",
+        seed=0,
+        max_episode_steps=120,
+        gripper_force_limit=60.0,
+        gripper_force_control=True,
+    )
+    task = TaskSpec(
+        0,
+        shape="box",
+        object_half_width=0.02,
+        object_half_height=0.02,
+        object_mass=0.2,
+        object_table_friction=1.0,
+        object_finger_friction=1.0,
+    )
+    try:
+        environment.set_task_properties(task)
+        observation, _ = environment.reset()
+        careful = EXPERT_VARIANTS["careful"]
+        low_effort = np.array([0.0, 0.0, 0.0, 0.01], dtype=np.float32)
+        full_effort = np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float32)
+        for _ in range(100):
+            observation, _, terminated, truncated, _ = environment.step(careful.get_action(observation))
+            low_grasp = environment.unwrapped.compute_reward(low_effort, observation)[4]
+            full_grasp = environment.unwrapped.compute_reward(full_effort, observation)[4]
+            if full_grasp - low_grasp > 0.1:
+                break
+            assert not (terminated or truncated)
+        else:
+            pytest.fail("The expert never reached a state with an action-dependent caging reward.")
+
+        # This assertion concerns post-contact squeeze control. Caging alone
+        # can become reward-positive just before MuJoCo reports contact.
+        environment._gripper_contact_latched = True
+        next_observation, reward, _, _, info = environment.step(low_effort)
+        expected = environment.unwrapped.compute_reward(low_effort, next_observation)
+        incorrectly_full = environment.unwrapped.compute_reward(full_effort, next_observation)
+        assert reward == pytest.approx(expected[0])
+        assert info["grasp_reward"] == pytest.approx(expected[4])
+        assert info["grasp_reward"] < incorrectly_full[4]
+    finally:
+        environment.close()
+
+
+def test_force_control_separates_precontact_closing_from_postcontact_squeeze() -> None:
+    pytest.importorskip("metaworld")
+    from moebius.envs import MetaWorldSingleTaskEnv
+
+    limit = 60.0
+    requested_effort = 0.2
+    environment = MetaWorldSingleTaskEnv(
+        "pick-place-v3",
+        seed=0,
+        max_episode_steps=10,
+        gripper_force_limit=limit,
+        gripper_force_control=True,
+    )
+    task = TaskSpec(
+        0,
+        shape="box",
+        object_half_width=0.02,
+        object_half_height=0.02,
+    )
+    try:
+        environment.set_task_properties(task)
+        environment.reset()
+        environment._object_bilateral_finger_contact = lambda: False
+        _, _, _, _, info = environment.step(np.array([0.0, 0.0, 0.0, requested_effort], dtype=np.float32))
+        force_range = environment.unwrapped.model.actuator_forcerange[environment._finger_actuator_ids]
+        assert info["gripper_precontact_closing"]
+        assert not info["gripper_contact_latched"]
+        assert np.allclose(force_range, (-limit, limit))
+
+        # Only bilateral pad contact switches into squeeze control.
+        environment._object_bilateral_finger_contact = lambda: True
+        _, _, _, _, info = environment.step(np.array([0.0, 0.0, 0.0, requested_effort], dtype=np.float32))
+        force_range = environment.unwrapped.model.actuator_forcerange[environment._finger_actuator_ids]
+        assert not info["gripper_precontact_closing"]
+        assert info["gripper_contact_latched"]
+        assert info["gripper_bilateral_contact"]
+        assert info["gripper_requested_effort"] == pytest.approx(requested_effort)
+        assert info["gripper_contact_latched"] == environment.unwrapped._prev_obs[11]
+        assert np.allclose(force_range, (-requested_effort * limit, requested_effort * limit))
+
+        # Opening uses fixed drive and explicitly starts a new approach.
+        environment.step(np.array([0.0, 0.0, 0.0, -0.1], dtype=np.float32))
+        force_range = environment.unwrapped.model.actuator_forcerange[environment._finger_actuator_ids]
+        assert not environment._gripper_contact_latched
+        assert np.allclose(force_range, (-limit, limit))
+    finally:
+        environment.close()
+
+
+def test_force_control_caging_reward_saturates_at_the_calibrated_effort() -> None:
+    pytest.importorskip("metaworld")
+    from moebius.envs import MetaWorldSingleTaskEnv
+
+    environment = MetaWorldSingleTaskEnv(
+        "pick-place-v3",
+        seed=0,
+        max_episode_steps=120,
+        gripper_force_limit=60.0,
+        gripper_force_control=True,
+    )
+    task = TaskSpec(
+        0,
+        shape="box",
+        object_half_width=0.02,
+        object_half_height=0.02,
+        object_mass=0.2,
+        object_table_friction=1.0,
+        object_finger_friction=1.0,
+        object_grip_effort=0.35,
+    )
+    try:
+        environment.set_task_properties(task)
+        observation, _ = environment.reset()
+        careful = EXPERT_VARIANTS["careful"]
+        below = np.array([0.0, 0.0, 0.0, 0.1], dtype=np.float32)
+        calibrated = np.array([0.0, 0.0, 0.0, 0.35], dtype=np.float32)
+        full = np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float32)
+        for _ in range(100):
+            observation, _, terminated, truncated, _ = environment.step(careful.get_action(observation))
+            low_grasp = environment.unwrapped.compute_reward(below, observation)[4]
+            calibrated_grasp = environment.unwrapped.compute_reward(calibrated, observation)[4]
+            if calibrated_grasp - low_grasp > 0.1:
+                break
+            assert not (terminated or truncated)
+        else:
+            pytest.fail("The expert never reached a state with an action-dependent caging reward.")
+
+        full_grasp = environment.unwrapped.compute_reward(full, observation)[4]
+        assert calibrated_grasp == pytest.approx(full_grasp)
+        assert low_grasp < calibrated_grasp
+    finally:
+        environment.close()
+
+
 def test_default_expert_matches_metaworld_policy() -> None:
     policies = pytest.importorskip("metaworld.policies")
     reference = policies.SawyerPickPlaceV3Policy()
@@ -153,6 +429,60 @@ def test_default_expert_matches_metaworld_policy() -> None:
         observation[3] = rng.uniform(0, 1)
         expected = np.clip(reference.get_action(observation), -1, 1)
         assert np.allclose(expert.get_action(observation), expected, atol=1e-6)
+
+
+def test_contact_observations_read_the_object_weight_from_the_table() -> None:
+    pytest.importorskip("metaworld")
+    from moebius.envs import CONTACT_FORCE_SCALE, CONTACT_SLICE, MetaWorldSingleTaskEnv
+
+    environment = MetaWorldSingleTaskEnv("pick-place-v3", seed=0, max_episode_steps=20, contact_observations=True)
+    try:
+        for mass in (0.2, 1.0):
+            environment.set_task_properties(
+                TaskSpec(
+                    0,
+                    shape="box",
+                    object_half_width=0.02,
+                    object_half_height=0.02,
+                    object_mass=mass,
+                    object_table_friction=1.0,
+                    object_finger_friction=1.0,
+                )
+            )
+            environment.reset()
+            for _ in range(5):  # hand stays above the object with the gripper open
+                observation, *_ = environment.step(np.array([0.0, 0.0, 0.0, -1.0], dtype=np.float32))
+            forces = observation[CONTACT_SLICE] * CONTACT_FORCE_SCALE
+            # The table holds the object up with its weight; the fingers do nothing.
+            assert forces[5] == pytest.approx(9.81 * mass, rel=0.2)
+            assert np.allclose(forces[[0, 1, 2, 6]], 0.0, atol=1e-6)
+            assert np.all(np.abs(observation[CONTACT_SLICE]) <= 5.0)
+            # The frame-stacked previous frame carries the forces too.
+            assert observation[18 + 16] * CONTACT_FORCE_SCALE == pytest.approx(9.81 * mass, rel=0.2)
+    finally:
+        environment.close()
+
+
+def test_pick_out_of_hole_reward_accepts_objects_wider_than_native_pad_threshold() -> None:
+    pytest.importorskip("metaworld")
+    from moebius.envs import MetaWorldSingleTaskEnv
+
+    environment = MetaWorldSingleTaskEnv("pick-out-of-hole-v3", seed=0, max_episode_steps=5)
+    try:
+        environment.set_task_properties(
+            TaskSpec(
+                0,
+                shape="box",
+                object_half_width=TrainConfig.object_half_width_max,
+                object_half_height=0.02,
+                env_name="pick-out-of-hole-v3",
+            )
+        )
+        environment.reset()
+        _, reward, *_ = environment.step(np.zeros(4, dtype=np.float32))
+        assert np.isfinite(reward)
+    finally:
+        environment.close()
 
 
 def _episode(start: float, steps: int, observation_dim: int = 8, moving: bool = False) -> Batch:
@@ -251,6 +581,15 @@ def test_demonstration_augmented_sac_updates_and_decays_bc_loss() -> None:
     assert online_bc_weight(TrainConfig(bc_weight=1.0, bc_decay_steps=100), 0) == 1.0
     assert online_bc_weight(TrainConfig(bc_weight=1.0, bc_decay_steps=100), 50) == 0.5
     assert online_bc_weight(TrainConfig(bc_weight=1.0, bc_decay_steps=100), 100) == 0.0
+
+
+def test_force_features_are_opt_in_for_regular_pearl() -> None:
+    config = TrainConfig()
+    assert config.gripper_force_limit is None
+    assert not config.gripper_force_control
+    assert not config.contact_observations
+    assert config.pearl_grip_penalty == 0.0
+    assert config.pearl_expert_variants == ("careful", "slow_transport", "low_grasp", "metaworld")
 
 
 def test_context_encoder_is_permutation_invariant() -> None:
@@ -453,7 +792,7 @@ def _random_multitask_buffer(observation_dim: int, action_dim: int, reward: floa
 
 
 def test_behavior_cloning_does_not_train_the_encoder() -> None:
-    """PEARL's encoder learns only from the critic loss and KL."""
+    """The encoder learns only from the critic loss, KL and the auxiliary decoder."""
     agent = PEARLAgent(3, np.full(2, -1.0), np.full(2, 1.0), latent_dim=4, hidden_dim=16)
     encoder_before = [parameter.detach().clone() for parameter in agent.encoder.parameters()]
     actor_before = [parameter.detach().clone() for parameter in agent.actor.parameters()]
@@ -462,6 +801,51 @@ def test_behavior_cloning_does_not_train_the_encoder() -> None:
 
     assert all(torch.equal(before, after) for before, after in zip(encoder_before, agent.encoder.parameters()))
     assert any(not torch.equal(before, after) for before, after in zip(actor_before, agent.actor.parameters()))
+
+
+def test_online_force_control_bc_clones_grip_direction_not_magnitude() -> None:
+    expert = torch.tensor([[0.2, -0.3, 0.4, 1.0]])
+    gentle_close = torch.tensor([[0.2, -0.3, 0.4, 0.2]])
+    full_close = torch.tensor([[0.2, -0.3, 0.4, 1.0]])
+    wrong_direction = torch.tensor([[0.2, -0.3, 0.4, -0.2]])
+
+    gentle_loss = PEARLAgent._behavior_cloning_action_loss(gentle_close, expert, clone_grip_magnitude=False)
+    full_loss = PEARLAgent._behavior_cloning_action_loss(full_close, expert, clone_grip_magnitude=False)
+    wrong_loss = PEARLAgent._behavior_cloning_action_loss(wrong_direction, expert, clone_grip_magnitude=False)
+    assert gentle_loss == pytest.approx(0.0)
+    assert full_loss == pytest.approx(0.0)
+    assert wrong_loss > gentle_loss
+    assert PEARLAgent._behavior_cloning_action_loss(gentle_close, expert, clone_grip_magnitude=True) > 0
+
+
+def test_decoder_loss_trains_the_encoder_and_logs_z_gain() -> None:
+    torch.manual_seed(0)
+    agent = PEARLAgent(
+        12, np.full(2, -1.0), np.full(2, 1.0), latent_dim=4, hidden_dim=16, decoder_weight=1.0
+    )
+    task_batch = _random_multitask_buffer(12, 2).sample_meta_batch(2, 8, 6)
+    observations = agent._flatten(task_batch.rl.observations)
+    actions = agent._flatten(task_batch.rl.actions)
+    targets = agent._decoder_targets(
+        observations, agent._flatten(task_batch.rl.rewards), agent._flatten(task_batch.rl.next_observations)
+    )
+    # Observation entries 3..11 (the decoded slice 3:18 clipped to 12 values) plus the reward.
+    assert targets.shape == (observations.shape[0], 10)
+    mean, log_variance = agent.encoder(agent._tensor(context_from_batch(task_batch.context, agent.reward_scale)))
+    latents = agent._expand_latents(agent._sample_latents(mean, log_variance), task_batch.rl.observations.shape[1])
+    agent._decoder_loss(observations, actions, latents, targets).backward()
+    assert any(parameter.grad is not None and parameter.grad.abs().sum() > 0 for parameter in agent.encoder.parameters())
+
+    metrics = agent.update_critic(task_batch)
+    assert np.isfinite(metrics["loss/decoder"]) and np.isfinite(metrics["stats/decoder_z_gain"])
+    assert "decoder" in agent.state_dict()
+
+
+def test_decoder_weight_zero_restores_original_pearl_objective() -> None:
+    agent = PEARLAgent(12, np.full(2, -1.0), np.full(2, 1.0), latent_dim=4, hidden_dim=16, decoder_weight=0.0)
+    metrics = agent.update_critic(_random_multitask_buffer(12, 2).sample_meta_batch(2, 8, 6))
+    assert agent.decoder is None and "decoder" not in agent.state_dict()
+    assert "loss/decoder" not in metrics and "stats/decoder_z_gain" not in metrics
 
 
 def test_critic_uses_layer_norm_by_default() -> None:
@@ -583,3 +967,15 @@ def test_low_grasp_stops_descending_at_the_hand_floor() -> None:
 
     assert np.allclose(waiting[:3], 0.0) and waiting[3] == 1.0
     assert np.all(carrying[:3] > 0)
+
+
+def test_low_grasp_keeps_lifting_a_short_object() -> None:
+    """At the floor the hand is ~2.7 cm above a short box; lifting must not re-trigger the descent."""
+    observation = np.zeros(39)
+    observation[:3] = (0.0, 0.6, 0.063)  # hand lifted 1.6 cm above the floor
+    observation[3] = observation[21] = 0.54  # gripper closed on the object
+    observation[4:7] = (0.005, 0.6, 0.036)  # object lifted 1.6 cm, still below 4 cm
+    observation[24] = 0.033  # and rising
+    observation[36:39] = (0.1, 0.8, 0.2)
+    for name in ("low_grasp", "careful"):
+        assert EXPERT_VARIANTS[name].get_action(observation)[2] > 0, name

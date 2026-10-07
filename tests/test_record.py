@@ -4,7 +4,24 @@ import numpy as np
 import torch
 
 from moebius.pearl import PEARLAgent
-from moebius.record import load_pearl_agent
+from moebius.record import checkpoint_environment_options, load_pearl_agent
+
+
+def test_force_control_checkpoint_options_apply_only_to_pearl() -> None:
+    config = {
+        "gripper_force_limit": 60.0,
+        "contact_observations": True,
+        "gripper_force_control": True,
+        "pearl_grip_penalty": 1.0,
+    }
+
+    assert checkpoint_environment_options(config, "sac") == {}
+    assert checkpoint_environment_options(config, "pearl") == {
+        "gripper_force_limit": 60.0,
+        "contact_observations": True,
+        "gripper_force_control": True,
+        "grip_penalty": 1.0,
+    }
 
 
 def test_load_pearl_agent_restores_encoder_and_latent_policy() -> None:
@@ -33,4 +50,3 @@ def test_load_pearl_agent_restores_encoder_and_latent_policy() -> None:
         assert torch.equal(restored_parameter, source_parameter)
     action = restored.act(np.zeros(observation_dim, dtype=np.float32), deterministic=True)
     assert action.shape == (action_dim,)
-

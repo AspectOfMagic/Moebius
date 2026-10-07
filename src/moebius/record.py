@@ -18,6 +18,18 @@ from moebius.replay_buffer import Batch
 UPSIDE_DOWN_CAMERAS = frozenset({"corner"})
 
 
+def checkpoint_environment_options(config: dict[str, Any], algorithm: str) -> dict[str, Any]:
+    """Environment features saved by PEARL; SAC always uses its baseline dynamics."""
+    if algorithm != "pearl":
+        return {}
+    return {
+        "gripper_force_limit": config.get("gripper_force_limit"),
+        "contact_observations": bool(config.get("contact_observations", False)),
+        "gripper_force_control": bool(config.get("gripper_force_control", False)),
+        "grip_penalty": float(config.get("pearl_grip_penalty", 0.0)),
+    }
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Record SAC or PEARL evaluation episodes as MP4 files.")
     parser.add_argument("--checkpoint", type=Path, required=True)
@@ -86,6 +98,7 @@ def load_pearl_agent(checkpoint: dict[str, Any], environment: MetaWorldSingleTas
         kl_free_bits=float(config.get("kl_free_bits", 0.1)),
         # Checkpoints from before this option have plain critics.
         critic_layer_norm=bool(config.get("pearl_critic_layer_norm", False)),
+        decoder_weight=float(config.get("pearl_decoder_weight", 0.0)),
         device=device,
     )
     state = checkpoint["agent"]
@@ -192,6 +205,8 @@ def record_pearl(
             int(config["num_eval_tasks"]),
             ObjectPropertyBounds.from_config(config),
             seed=int(config["seed"]),
+            env_names=tuple(config.get("pearl_env_names", (config["env_name"],))),
+            vary_dynamics=bool(config.get("pearl_vary_object_dynamics", True)),
         )
         test_tasks = sampler.test_tasks
     else:
@@ -217,7 +232,7 @@ def record_pearl(
         motion_threshold=float(config.get("context_motion_threshold", 1e-3)),
     )
     rng = np.random.default_rng(int(config["seed"]) + 60_000)
-    name_prefix = f"{config['env_name']}_pearl_task{args.task_index}"
+    name_prefix = f"{task.env_name or config['env_name']}_pearl_task{args.task_index}"
     rotate_180 = args.camera_name in UPSIDE_DOWN_CAMERAS
     for episode in range(adaptation_episodes):
         video_path = args.video_dir / f"{name_prefix}_context_{episode + 1}.mp4"
@@ -245,13 +260,19 @@ def record(args: argparse.Namespace) -> None:
     algorithm = config.get("algorithm", "sac")
     if algorithm not in ("sac", "pearl"):
         raise ValueError(f"Unsupported checkpoint algorithm: {algorithm}")
+    environment_name = config["env_name"]
+    if algorithm == "pearl" and checkpoint.get("task_specs") is not None:
+        test_specs = checkpoint["task_specs"]["test"]
+        if not 0 <= args.task_index < len(test_specs):
+            raise ValueError(f"--task-index must be in [0, {len(test_specs) - 1}].")
+        environment_name = test_specs[args.task_index].get("env_name") or environment_name
     environment = MetaWorldSingleTaskEnv(
-        env_name=config["env_name"],
+        env_name=environment_name,
         seed=int(config["seed"]),
         max_episode_steps=int(config["max_episode_steps"]),
         render_mode="rgb_array",
         camera_name=args.camera_name,
-        gripper_force_limit=config.get("gripper_force_limit"),
+        **checkpoint_environment_options(config, algorithm),
     )
     args.video_dir.mkdir(parents=True, exist_ok=True)
 

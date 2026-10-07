@@ -13,6 +13,14 @@ class TrainConfig:
     # object/goal configurations used as PEARL tasks; only the bookkeeping
     # task identifier is omitted from the observation.
     env_name: str = "pick-place-v3"
+    # PEARL shares one policy and encoder across these compatible
+    # pick-and-place environments. SAC continues to use only ``env_name``.
+    pearl_env_names: tuple[str, ...] = (
+        "pick-place-v3",
+        "pick-place-wall-v3",
+        "shelf-place-v3",
+        "pick-out-of-hole-v3",
+    )
     seed: int = 1
     total_steps: int = 250_000
     start_steps: int = 10_000
@@ -36,7 +44,7 @@ class TrainConfig:
     bc_weight: float = 1.0
     bc_decay_steps: int = 250_000
     pearl_task_distribution: str = "dynamics"
-    # PEARL dynamics tasks: object shape, size and hidden physical properties.
+    # PEARL shape tasks: object shape and size, with optional hidden dynamics.
     # Bounds deliberately live in configuration rather than the CLI: they
     # define the experiment's task family and are saved with the checkpoint.
     # Shapes are assigned round-robin; spheres use half_width as the radius
@@ -50,8 +58,9 @@ class TrainConfig:
     object_half_height_max: float = 0.03
     object_bar_half_length_min: float = 0.04
     object_bar_half_length_max: float = 0.07
-    # Hidden properties. Mass with finger friction decides whether a grasp
-    # slips; low table friction makes the object slide or roll when touched.
+    # Hidden dynamics are optional. The default shape-only experiment keeps
+    # each MetaWorld environment's nominal mass and friction.
+    pearl_vary_object_dynamics: bool = False
     object_mass_min: float = 0.1
     # Capped at 1.2 kg: with a 60 N gripper limit, 2 kg objects were mostly
     # unsolvable by every expert variant.
@@ -63,12 +72,33 @@ class TrainConfig:
     # Newtons per finger; None keeps MetaWorld's unlimited servo, under which
     # mass and friction barely affect the grasp. Pick a value with
     # moebius-sweep.
+    # Force control is an opt-in PEARL experiment; regular PEARL keeps
+    # MetaWorld's original unlimited position servo.
     gripper_force_limit: float | None = None
-    # Scripted expert variants tried, in order, by the feasibility check.
-    # The first variant that solves a task provides its demonstrations, so the
-    # generally strongest variant comes first. Under a force limit and short
-    # episodes the sweep found careful best for boxes and bars and
-    # slow_transport best for cylinders.
+    # Before contact, a positive gripper action closes at a fixed full drive.
+    # After contact, its magnitude is the requested squeeze as a fraction of
+    # gripper_force_limit. This separates approach speed from holding force.
+    gripper_force_control: bool = False
+    # Reward penalty for squeezing harder than the object needs, per step at
+    # a full squeeze beyond what it needs (MetaWorld's reward is at most 10
+    # per step). The needed grip is calibrated per task during setup (see
+    # pearl_grip_effort_levels). 0 disables the penalty.
+    pearl_grip_penalty: float = 0.0
+    # Grip commands tried, from lowest up, to find each task's lowest reliable
+    # grip (4 of 5 expert successes), including a full grip. The reward
+    # penalty supplies its own measurement tolerance, so calibration does not
+    # add a second margin. Demonstrations keep a common full grip so the
+    # task-agnostic behavior-cloning warm start has one consistent target; RL
+    # then learns to reduce force from that reliable starting policy.
+    pearl_grip_effort_levels: tuple[float, ...] = (0.1, 0.2, 0.35, 0.5, 0.7, 0.8, 0.9, 1.0)
+    # Put the forces on the object (from the fingers, from the table, and the
+    # grip squeeze) into observation slots 11:18, which pick-place leaves
+    # empty. MetaWorld moves the hand kinematically, so without them mass and
+    # friction are invisible until the object slips. PEARL runs only.
+    contact_observations: bool = False
+    # Ordered grasp strategies tried for the optional single-environment
+    # force-control experiment. Normal multi-environment training uses one
+    # dedicated MetaWorld policy per environment instead.
     pearl_expert_variants: tuple[str, ...] = ("careful", "slow_transport", "low_grasp", "metaworld")
     # Number of distinct property vectors tried when finding one that can
     # yield the requested expert demonstrations.
@@ -88,6 +118,11 @@ class TrainConfig:
     # to disable. LayerNorm in the critics limits value extrapolation.
     pearl_max_reward: float = 10.0
     pearl_critic_layer_norm: bool = True
+    # Auxiliary encoder objective (not in original PEARL): a decoder predicts
+    # each transition's object motion, gripper change and reward from
+    # (s, a, z), and its error trains the encoder alongside the critic loss.
+    # 0 disables it.
+    pearl_decoder_weight: float = 0.0
     # Store the scripted expert's failed attempts (accepted training tasks
     # only) as online experience and context. Never behavior-cloned.
     pearl_replay_failed_demos: bool = True

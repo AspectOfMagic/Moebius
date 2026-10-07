@@ -92,6 +92,22 @@ class QNetwork(nn.Module):
         return self.network(torch.cat(inputs, dim=-1))
 
 
+class TransitionDecoder(nn.Module):
+    """Predict a transition's outcome from (state, action, task latent).
+
+    Auxiliary model in the style of VariBAD: its prediction error trains the
+    encoder, so z is pushed to carry whatever about the object changes how it
+    moves and how much reward a step earns.
+    """
+
+    def __init__(self, observation_dim: int, action_dim: int, latent_dim: int, hidden_dim: int, output_dim: int) -> None:
+        super().__init__()
+        self.network = mlp(observation_dim + action_dim + latent_dim, output_dim, hidden_dim)
+
+    def forward(self, observation: Tensor, action: Tensor, latent: Tensor) -> Tensor:
+        return self.network(torch.cat((observation, action, latent), dim=-1))
+
+
 class ContextEncoder(nn.Module):
     """Infer a diagonal Gaussian task posterior from unordered transitions.
 

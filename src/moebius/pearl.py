@@ -12,8 +12,14 @@ from torch import Tensor
 from torch.nn import functional as F
 
 from moebius.context import ContextBuilder
-from moebius.networks import ContextEncoder, QNetwork, SquashedGaussianActor
+from moebius.networks import ContextEncoder, QNetwork, SquashedGaussianActor, TransitionDecoder
 from moebius.replay_buffer import Batch, TaskBatch
+
+# Observation entries the auxiliary decoder predicts the one-step change of:
+# gripper opening (3), object position (4:7), object quaternion (7:11) and,
+# with contact observations, the forces on the object (11:18; always zero,
+# and so trivially predicted, without them).
+DECODED_STATE = slice(3, 18)
 
 
 def context_from_batch(batch: Batch, reward_scale: float = 1.0) -> np.ndarray:
@@ -76,6 +82,8 @@ class PEARLAgent:
         min_posterior_std: float = 0.05,
         max_reward: float | None = 10.0,
         critic_layer_norm: bool = True,
+        decoder_weight: float = 0.0,
+        decoder_lr: float = 3e-4,
         device: str = "cpu",
     ) -> None:
         if latent_dim < 1:
@@ -110,6 +118,20 @@ class PEARLAgent:
         self.actor_optimizer = torch.optim.Adam(self.actor.parameters(), lr=actor_lr)
         self.critic_optimizer = torch.optim.Adam(list(self.q1.parameters()) + list(self.q2.parameters()), lr=critic_lr)
         self.encoder_optimizer = torch.optim.Adam(self.encoder.parameters(), lr=encoder_lr)
+        if decoder_weight < 0:
+            raise ValueError("decoder_weight must be non-negative.")
+        # Auxiliary transition decoder (0 disables it). It predicts the change
+        # in gripper opening, object position and object orientation, plus
+        # the scaled reward, from (s, a, z).
+        self.decoder_weight = decoder_weight
+        self.decoder = None
+        self.decoder_optimizer = None
+        if decoder_weight > 0:
+            output_dim = len(range(observation_dim)[DECODED_STATE]) + 1
+            self.decoder = TransitionDecoder(observation_dim, action_dim, latent_dim, hidden_dim, output_dim).to(
+                self.device
+            )
+            self.decoder_optimizer = torch.optim.Adam(self.decoder.parameters(), lr=decoder_lr)
         # alpha is expressed in scaled-reward units (the same units as Q). With
         # automatic tuning, start small so the behavior-cloned policy is not
         # immediately pushed toward uniform random actions.
@@ -276,9 +298,28 @@ class PEARLAgent:
         if empty_context:
             penalized_kl = torch.zeros((), device=self.device)
         inference_loss = critic_loss + self.kl_weight * penalized_kl
+        decoder_metrics: dict[str, float] = {}
+        use_decoder = self.decoder is not None and not empty_context
+        if use_decoder:
+            targets = self._decoder_targets(observations, rewards, next_observations)
+            decoder_loss = self._decoder_loss(observations, actions, expanded_latents, targets)
+            inference_loss = inference_loss + self.decoder_weight * decoder_loss
+            with torch.no_grad():
+                decoder_metrics["loss/decoder"] = decoder_loss.item()
+                if tasks > 1:
+                    # Loss with every task given another task's latent, minus
+                    # the true loss. Positive means z carries information that
+                    # predicts this task's transitions.
+                    wrong_latents = self._expand_latents(torch.roll(latents, 1, dims=0), transitions)
+                    wrong_loss = self._decoder_loss(observations, actions, wrong_latents, targets)
+                    decoder_metrics["stats/decoder_z_gain"] = (wrong_loss - decoder_loss).item()
+            self.decoder_optimizer.zero_grad()
         self.critic_optimizer.zero_grad()
         self.encoder_optimizer.zero_grad()
         inference_loss.backward()
+        if use_decoder:
+            torch.nn.utils.clip_grad_norm_(self.decoder.parameters(), self.gradient_clip_norm)
+            self.decoder_optimizer.step()
         critic_gradient_norm = torch.nn.utils.clip_grad_norm_(
             list(self.q1.parameters()) + list(self.q2.parameters()), self.gradient_clip_norm
         )
@@ -297,6 +338,7 @@ class PEARLAgent:
         }
         if self.max_scaled_reward is not None:
             metrics["stats/q_upper_bound"] = q_upper_bound
+        metrics.update(decoder_metrics)
         if not empty_context:
             # Posterior statistics are only meaningful with context; logging
             # the k = 0 prior would mask whether inference is working.
@@ -319,6 +361,7 @@ class PEARLAgent:
         task_batch: TaskBatch,
         demonstration_batch: TaskBatch | None = None,
         bc_weight: float = 0.0,
+        clone_grip_magnitude: bool = True,
     ) -> dict[str, float]:
         critic_metrics = self.update_critic(task_batch)
         context = self._tensor(context_from_batch(task_batch.context, self.reward_scale))
@@ -350,7 +393,12 @@ class PEARLAgent:
             # a separate, clean expert-only context.
             with torch.no_grad():
                 demo_latents = self._expand_latents(actor_task_latents, demo_transitions)
-            bc_loss, _, _ = self._behavior_cloning_loss(demo_observations, demo_actions, demo_latents)
+            bc_loss, _, _ = self._behavior_cloning_loss(
+                demo_observations,
+                demo_actions,
+                demo_latents,
+                clone_grip_magnitude=clone_grip_magnitude,
+            )
         actor_loss = sac_actor_loss + bc_weight * bc_loss
         self.actor_optimizer.zero_grad()
         actor_loss.backward()
@@ -381,8 +429,22 @@ class PEARLAgent:
             "stats/meta_batch_tasks": float(tasks),
         }
 
+    def _decoder_targets(self, observations: Tensor, scaled_rewards: Tensor, next_observations: Tensor) -> Tensor:
+        state_change = (next_observations - observations)[:, DECODED_STATE]
+        return torch.cat((state_change, scaled_rewards), dim=-1)
+
+    def _decoder_loss(self, observations: Tensor, actions: Tensor, latents: Tensor, targets: Tensor) -> Tensor:
+        """Mean squared error with each target standardized over the batch.
+
+        Object displacements are millimetres while rewards are of order one;
+        dividing by each target's (detached) batch std weights them equally.
+        """
+        scale = targets.std(dim=0, keepdim=True).clamp_min(1e-3).detach()
+        prediction = self.decoder(observations, actions, latents)
+        return (((prediction - targets) / scale) ** 2).mean()
+
     def state_dict(self) -> dict[str, object]:
-        return {
+        state: dict[str, object] = {
             "encoder": self.encoder.state_dict(),
             "actor": self.actor.state_dict(),
             "q1": self.q1.state_dict(),
@@ -391,17 +453,40 @@ class PEARLAgent:
             "target_q2": self.target_q2.state_dict(),
             "log_alpha": self.log_alpha.detach().cpu(),
         }
+        if self.decoder is not None:
+            state["decoder"] = self.decoder.state_dict()
+        return state
 
     def _tensor(self, array: np.ndarray) -> Tensor:
         return torch.as_tensor(array, dtype=torch.float32, device=self.device)
 
     def _behavior_cloning_loss(
-        self, observations: Tensor, actions: Tensor, latents: Tensor
+        self,
+        observations: Tensor,
+        actions: Tensor,
+        latents: Tensor,
+        clone_grip_magnitude: bool = True,
     ) -> tuple[Tensor, Tensor, Tensor]:
         predicted_actions, log_std = self.actor.deterministic_action_and_log_std(observations, latents)
-        action_loss = F.mse_loss(predicted_actions, actions)
+        action_loss = self._behavior_cloning_action_loss(predicted_actions, actions, clone_grip_magnitude)
         spread_loss = F.mse_loss(log_std, torch.full_like(log_std, self.bc_log_std_target))
         return action_loss + self.bc_log_std_weight * spread_loss, action_loss, spread_loss
+
+    @staticmethod
+    def _behavior_cloning_action_loss(
+        predicted_actions: Tensor, expert_actions: Tensor, clone_grip_magnitude: bool = True
+    ) -> Tensor:
+        """Clone all actions, or only XYZ and the gripper's open/close direction."""
+        if clone_grip_magnitude or expert_actions.shape[-1] < 4:
+            return F.mse_loss(predicted_actions, expert_actions)
+
+        movement_error = (predicted_actions[..., :-1] - expert_actions[..., :-1]).square().sum(dim=-1)
+        direction = expert_actions[..., -1].sign()
+        # A small margin teaches open versus close without pulling the policy
+        # toward the expert's force magnitude. Zero expert commands are ignored.
+        direction_error = F.relu(0.1 - direction * predicted_actions[..., -1]).square()
+        direction_error = torch.where(direction == 0, torch.zeros_like(direction_error), direction_error)
+        return (movement_error + direction_error).mean() / expert_actions.shape[-1]
 
     @staticmethod
     def _normalized_sac_actor_loss(alpha: Tensor, log_prob: Tensor, q_value: Tensor) -> tuple[Tensor, Tensor]:
