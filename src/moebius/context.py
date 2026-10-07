@@ -1,12 +1,4 @@
-"""One context-construction rule shared by PEARL training, evaluation and recording.
-
-Before this module, training sampled short chronological windows from anywhere
-in an episode, while rollouts used the last few transitions of the previous
-episode. The encoder was therefore trained on one context distribution and
-deployed on another. Every caller now builds the context for adaptation
-episode ``k`` from the ``k`` completed episodes before it, through
-:meth:`ContextBuilder.build`.
-"""
+"""Shared PEARL context construction for training, evaluation, and recording."""
 
 from __future__ import annotations
 
@@ -58,15 +50,7 @@ def object_motion_mask(observations: np.ndarray, next_observations: np.ndarray, 
 
 @dataclass(frozen=True)
 class ContextBuilder:
-    """Subsample a pool of earlier-episode transitions into one encoder context.
-
-    Hidden mass, friction and contact softness only affect transitions in
-    which the object is touched, so up to ``motion_fraction`` of the context
-    is drawn from transitions where the object moved. The rest is drawn
-    uniformly so the encoder still sees ordinary transitions. The encoder is
-    permutation invariant, so the order of the returned transitions is
-    irrelevant.
-    """
+    """Sample context from earlier episodes, prioritizing object motion."""
 
     context_size: int = 64
     motion_fraction: float = 0.75
@@ -84,11 +68,7 @@ class ContextBuilder:
         return int(sum(len(episode.observations) for episode in episodes))
 
     def build(self, episodes: Sequence[Batch], rng: np.random.Generator, size: int | None = None) -> Batch:
-        """Return ``min(size, pool)`` distinct transitions from ``episodes``.
-
-        ``episodes`` are the completed episodes before the current one in the
-        same adaptation sequence. No episodes means an empty context.
-        """
+        """Return distinct transitions from completed adaptation episodes."""
         if not episodes:
             raise ValueError("Use empty_context() when there are no previous episodes.")
         size = self.context_size if size is None else size
@@ -100,8 +80,7 @@ class ContextBuilder:
         moving, still = np.flatnonzero(motion), np.flatnonzero(~motion)
         moving_count = min(len(moving), int(round(self.motion_fraction * count)))
         chosen_moving = rng.choice(moving, size=moving_count, replace=False)
-        # Fill the remainder from stationary transitions first, then from any
-        # moving transitions not chosen yet (when the pool is mostly motion).
+        # Use extra motion samples only when stationary samples run out.
         filler = np.concatenate(
             (rng.permutation(still), rng.permutation(np.setdiff1d(moving, chosen_moving, assume_unique=True)))
         )
@@ -116,16 +95,7 @@ class ContextBuilder:
 
 
 class AdaptationContextBuffer:
-    """Recent adaptation sequences for each task, stored as completed episodes.
-
-    One sequence is the run of consecutive episodes on one task, exactly as in
-    training rollouts and evaluation. Sampling picks a number of previous
-    episodes ``k`` in ``[0, max_previous_episodes]`` and builds each task's
-    context from the first ``k`` episodes of one of its stored sequences, so
-    the encoder is trained on the same kind of context it receives before
-    adaptation episode ``k``. Keeping only a few recent sequences keeps the
-    context close to the current policy's behavior.
-    """
+    """Recent per-task adaptation sequences stored as completed episodes."""
 
     def __init__(
         self,
@@ -205,11 +175,7 @@ class AdaptationContextBuffer:
     def sample(
         self, task_ids: np.ndarray, builder: ContextBuilder, max_previous_episodes: int
     ) -> tuple[Batch, int]:
-        """Return stacked ``[tasks, n, ...]`` contexts and the shared ``k``.
-
-        ``k = 0`` yields zero-length contexts, matching the first episode of
-        every adaptation sequence, where the agent acts under ``z = 0``.
-        """
+        """Return stacked contexts and one shared adaptation step ``k``."""
         if max_previous_episodes < 0:
             raise ValueError("max_previous_episodes must be non-negative.")
         task_ids = np.asarray(task_ids, dtype=np.int64)
@@ -225,7 +191,6 @@ class AdaptationContextBuffer:
                 eligible = [sequence for sequence in self._sequences[int(task_id)] if len(sequence) >= previous_episodes]
                 sequence = eligible[int(self.rng.integers(len(eligible)))]
                 histories.append(sequence[:previous_episodes])
-            # Tensors need one context length for every task in the meta-batch.
             size = min(builder.context_size, min(builder.pool_size(history) for history in histories))
             contexts = [builder.build(history, self.rng, size) for history in histories]
         stacked = Batch(*(np.stack([getattr(context, field) for context in contexts]) for field in Batch.__dataclass_fields__))

@@ -21,11 +21,7 @@ def mlp(input_dim: int, output_dim: int, hidden_dim: int, layer_norm: bool = Fal
 
 
 class SquashedGaussianActor(nn.Module):
-    """Gaussian policy transformed into the environment's action bounds.
-
-    ``latent_dim`` is zero for ordinary SAC and positive for PEARL, where the
-    policy receives a task latent in addition to the environment observation.
-    """
+    """Bounded Gaussian policy, optionally conditioned on a task latent."""
 
     def __init__(
         self,
@@ -74,12 +70,7 @@ class SquashedGaussianActor(nn.Module):
 
 
 class QNetwork(nn.Module):
-    """State-action value function, optionally conditioned on a PEARL latent.
-
-    ``layer_norm`` bounds the hidden features, which limits how far Q can
-    extrapolate on unfamiliar actions and latents (a common cause of
-    off-policy value divergence).
-    """
+    """State-action value function, optionally conditioned on a task latent."""
 
     def __init__(
         self, observation_dim: int, action_dim: int, hidden_dim: int, latent_dim: int = 0, layer_norm: bool = False
@@ -93,12 +84,7 @@ class QNetwork(nn.Module):
 
 
 class TransitionDecoder(nn.Module):
-    """Predict a transition's outcome from (state, action, task latent).
-
-    Auxiliary model in the style of VariBAD: its prediction error trains the
-    encoder, so z is pushed to carry whatever about the object changes how it
-    moves and how much reward a step earns.
-    """
+    """Predict transition outcomes from state, action, and task latent."""
 
     def __init__(self, observation_dim: int, action_dim: int, latent_dim: int, hidden_dim: int, output_dim: int) -> None:
         super().__init__()
@@ -109,18 +95,10 @@ class TransitionDecoder(nn.Module):
 
 
 class ContextEncoder(nn.Module):
-    """Infer a diagonal Gaussian task posterior from unordered transitions.
+    """Combine unordered transition factors into a Gaussian task posterior.
 
-    Each transition emits a Gaussian factor.  The factors are combined with a
-    unit-normal prior using a product of diagonal Gaussians, which is invariant
-    to the order of the context transitions and gives the prior for empty
-    context.
-
-    Per-transition variances use ``softplus`` rather than a clamped
-    log-variance. A hard clamp has zero gradient once saturated: earlier runs
-    pinned every factor at the clamp ceiling, the posterior sat on the prior
-    and the encoder could not recover. The posterior floor is additive for the
-    same reason.
+    ``softplus`` keeps factor-variance gradients alive; an additive posterior
+    floor prevents overconfidence.
     """
 
     _MIN_FACTOR_VARIANCE = 1e-4
@@ -134,10 +112,7 @@ class ContextEncoder(nn.Module):
         self.network = mlp(context_dim, 2 * latent_dim, hidden_dim)
 
     def forward(self, context: Tensor) -> tuple[Tensor, Tensor]:
-        """Return posterior mean and log variance for ``[tasks, context, features]``.
-
-        A zero-length context returns the prior ``N(0, I)`` (plus the floor).
-        """
+        """Return posterior parameters for ``[tasks, context, features]``."""
         if context.ndim != 3:
             raise ValueError("Context must have shape [num_tasks, context_size, context_dim].")
         parameters = self.network(context)
@@ -145,7 +120,7 @@ class ContextEncoder(nn.Module):
         variances = F.softplus(raw_variances) + self._MIN_FACTOR_VARIANCE
         precisions = variances.reciprocal()
 
-        # Include p(z) = N(0, I) as one additional Gaussian factor.
+        # Include the unit-normal prior as another Gaussian factor.
         posterior_precision = 1 + precisions.sum(dim=1)
         posterior_variance = posterior_precision.reciprocal()
         posterior_mean = posterior_variance * (precisions * means).sum(dim=1)

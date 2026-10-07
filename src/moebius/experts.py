@@ -1,10 +1,4 @@
-"""Scripted pick-and-place experts with tunable grasp and transport.
-
-``PickPlaceExpert()`` with default arguments reproduces MetaWorld's
-``SawyerPickPlaceV3Policy`` exactly. The named variants change only how the
-object is grasped and carried, which is what differs between objects that are
-light or heavy, grippy or slippery, and stable or prone to sliding.
-"""
+"""Scripted pick-and-place experts with tunable grasp and transport."""
 
 from __future__ import annotations
 
@@ -23,35 +17,7 @@ _GOAL = slice(36, 39)
 
 @dataclass(frozen=True)
 class PickPlaceExpert:
-    """A stateless pick-place controller over MetaWorld observations.
-
-    Phases, as in MetaWorld's policy: hover above the object, descend, close
-    the gripper, then carry the object to the goal.
-
-    grasp_height: target height of the hand above the object centre while descending.
-    descend_tolerance: descending stops once the hand is this close to the object in z.
-    max_object_height: only descend while the object centre is below this height.
-    close_threshold: wait until the normalised gripper opening drops below this.
-    settle: also wait until the gripper opening stops changing between frames,
-        so the grip is fully established before lifting.
-    transport_gain, transport_speed: proportional gain and per-axis action cap
-        while carrying the object (1.0 = MetaWorld's full speed).
-    hand_floor: lowest hand height MetaWorld allows (pick-place clamps the hand
-        at z = 0.05). When set, descending also stops once the hand reaches it,
-        so a grasp target below the floor means "as low as the hand can go"
-        instead of descending forever, and never resumes while the object is
-        rising: at the floor the hand can sit more than ``descend_tolerance``
-        above a short object, and lifting it would otherwise re-trigger the
-        descent. ``None`` keeps MetaWorld's behavior.
-    grip_effort: gripper action while grasping (MetaWorld: 1.0). With the
-        environment's ``gripper_force_control`` it is the fraction of the
-        gripper force limit to squeeze with. Training sets it per object to
-        the lowest grip that reliably works (see ``object_grip_effort``).
-    open_effort: gripper action away from the object (MetaWorld: 0.0). With
-        ``gripper_force_control`` an action of 0 does not drive the fingers,
-        so the variants used there open with -1.0 (identical under
-        MetaWorld's position control).
-    """
+    """Stateless hover, descend, grasp, and transport controller."""
 
     grasp_height: float = 0.03
     descend_tolerance: float = 0.05
@@ -98,14 +64,10 @@ class PickPlaceExpert:
 
 
 EXPERT_VARIANTS: dict[str, PickPlaceExpert] = {
-    # MetaWorld's scripted policy, unchanged.
     "metaworld": PickPlaceExpert(),
-    # Grasp as low as the hand can reach (about 2-3 cm lower than MetaWorld's
-    # policy): closer to the object's centre, steadier for tall or long objects.
+    # Lower grasps reduce torque on tall and long objects.
     "low_grasp": PickPlaceExpert(grasp_height=0.01, descend_tolerance=0.02, hand_floor=0.05, open_effort=-1.0),
-    # Carry at 30% speed: less inertial load on a slipping or heavy object.
     "slow_transport": PickPlaceExpert(transport_speed=0.3, open_effort=-1.0),
-    # Low grasp, wait for a settled grip, then carry slowly.
     "careful": PickPlaceExpert(
         grasp_height=0.01,
         descend_tolerance=0.02,

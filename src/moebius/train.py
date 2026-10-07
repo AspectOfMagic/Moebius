@@ -311,12 +311,7 @@ def collect_demonstrations(
     action_dim: int,
     writer: SummaryWriter,
 ) -> ReplayBuffer | None:
-    """Collect permanent, successful pick-and-place expert trajectories.
-
-    The expert environment is independent from evaluation and uses normal,
-    unseeded resets after construction, so it samples the training reset
-    distribution without exposing evaluation rollouts to the replay buffer.
-    """
+    """Collect successful pick-place demonstrations in a separate environment."""
     if config.demo_episodes == 0:
         return None
     if config.demo_episodes < 0:
@@ -327,7 +322,6 @@ def collect_demonstrations(
     capacity = config.demo_episodes * config.max_episode_steps
     buffer = ReplayBuffer(observation_dim, action_dim, capacity, config.seed + 10_000)
     environment = MetaWorldSingleTaskEnv(config.env_name, config.seed + 2, config.max_episode_steps)
-    # Identical to MetaWorld's SawyerPickPlaceV3Policy.
     expert = expert_variant("metaworld")
     successful_episodes = 0
     try:
@@ -338,13 +332,9 @@ def collect_demonstrations(
             info: dict[str, float] = {}
             while not (terminated or truncated):
                 action = np.asarray(expert.get_action(observation), dtype=np.float32)
-                # Scripted policies may rely on MetaWorld to clip their
-                # commands. Store the clipped action, since that is what the
-                # environment actually executes and what the actor can emit.
+                # Store the executable action, not an expert's out-of-range command.
                 action = np.clip(action, environment.action_space.low, environment.action_space.high)
                 next_observation, reward, terminated, truncated, info = environment.step(action)
-                # Preserve MetaWorld's terminal semantics; a success flag does
-                # not necessarily end an episode in this environment.
                 buffer.add(observation, action, reward, next_observation, terminated)
                 observation = next_observation
                 episode_return += reward
@@ -424,12 +414,10 @@ def train_sac(config: TrainConfig) -> None:
     observation, _ = environment.reset(seed=config.seed)
     episode_return, episode_length, episode = 0.0, 0, 0
     for step in range(1, config.total_steps + 1):
-        # Behavior cloning supplies a competent initial policy, replacing the
-        # random-action warm-up used by pure SAC.
         action = agent.act(observation) if demonstrations is not None or step > config.start_steps else environment.action_space.sample()
         next_observation, reward, terminated, truncated, info = environment.step(action)
         done = terminated or truncated
-        # Time limits are not environmental terminals and should bootstrap.
+        # Time limits bootstrap; true terminals do not.
         buffer.add(observation, action, reward, next_observation, terminated)
         observation = next_observation
         episode_return += reward
@@ -505,8 +493,7 @@ def _pearl_task_sampler(config: TrainConfig) -> GoalTaskSampler | DynamicsTaskSa
 
 Trajectory = list[tuple[np.ndarray, np.ndarray, float, np.ndarray, bool]]
 
-# A grip level is reliable with 4 successes in 5 attempts. The penalty's
-# measured-force tolerance is the only safety margin.
+# A reliable grip succeeds in four of five paired attempts.
 GRIP_SEARCH_ATTEMPTS = 5
 GRIP_SEARCH_SUCCESSES = 4
 GRIP_EFFORT_BANDS: tuple[tuple[str, frozenset[float]], ...] = (
@@ -517,11 +504,7 @@ GRIP_EFFORT_BANDS: tuple[tuple[str, frozenset[float]], ...] = (
 
 
 def grip_band_for_task(task_id: int, shape_count: int) -> tuple[str, frozenset[float]]:
-    """Assign balanced grip bands without tying one shape to one band.
-
-    Tasks arrive with shapes cycling fastest. Holding one band for a complete
-    shape cycle creates the cross product of shape and band before repeating.
-    """
+    """Cycle balanced grip bands across complete shape groups."""
     if shape_count < 1:
         raise ValueError("shape_count must be positive.")
     return GRIP_EFFORT_BANDS[(task_id // shape_count) % len(GRIP_EFFORT_BANDS)]
@@ -538,14 +521,7 @@ def lowest_reliable_grip(
     attempts: int = GRIP_SEARCH_ATTEMPTS,
     required: int = GRIP_SEARCH_SUCCESSES,
 ) -> float | None:
-    """Return the first of ``levels`` (lowest first) with ``required`` of ``attempts`` successes.
-
-    ``succeeds(level, attempt)`` runs one expert episode with that grip. The
-    attempt index lets calibration reuse the same reset across every level,
-    so placement difficulty is not mistaken for insufficient force. A level is
-    abandoned as soon as it can no longer reach ``required``. Returns None if
-    no level is reliable.
-    """
+    """Return the lowest level that reaches the required paired successes."""
     for level in levels:
         successes = 0
         for attempt in range(attempts):
@@ -562,8 +538,7 @@ class FeasibleDynamicsData:
     sampler: DynamicsTaskSampler
     demonstrations: MultiTaskReplayBuffer | None
     contexts: AdaptationContextBuffer | None
-    # Unsuccessful expert attempts on each accepted training task, in the
-    # order collected. Never cloned; optionally replayed as online experience.
+    # Failed attempts are replayable experience, never demonstrations.
     failed_trajectories: dict[int, list[Trajectory]] = field(default_factory=dict)
 
 
@@ -574,22 +549,7 @@ def collect_feasible_dynamics_data(
     action_dim: int,
     writer: SummaryWriter,
 ) -> FeasibleDynamicsData:
-    """Find solvable objects and retain their successful rollouts.
-
-    Normally, each environment's dedicated expert must produce
-    ``pearl_demo_episodes_per_task`` successes within
-    ``pearl_demo_max_attempts_per_task`` attempts. With gripper force control,
-    the configured pick-place expert strategies are tried in order and the
-    object's lowest reliable grip is found (``lowest_reliable_grip`` over
-    ``pearl_grip_effort_levels``). It is stored as ``object_grip_effort``,
-    which the grip penalty measures against.
-    Demonstrations still use one full grip for every task: behavior cloning is
-    task-agnostic under ``z = 0``, so asking it to imitate hidden, task-specific
-    force targets would be contradictory before the agent has context.
-    The successful trajectories are committed to the demonstration/context
-    buffers, so no second collection pass can fail merely because later
-    resets are less favorable.
-    """
+    """Find feasible tasks, calibrate grip when enabled, and retain demonstrations."""
     required_successes = config.pearl_demo_episodes_per_task
     max_attempts = config.pearl_demo_max_attempts_per_task
     if required_successes == 0:
@@ -608,8 +568,7 @@ def collect_feasible_dynamics_data(
         required_successes * config.max_episode_steps,
         config.seed + 20_000,
     )
-    # Every demonstration sequence is stored in each rotation, so sampling
-    # k previous episodes does not always use the same first k demos.
+    # Rotations prevent every context prefix from using the same demonstrations.
     contexts = AdaptationContextBuffer(
         (task.task_id for task in sampler.train_tasks),
         observation_dim,
@@ -630,8 +589,6 @@ def collect_feasible_dynamics_data(
 
     def experts_for_task(task: TaskSpec) -> tuple[tuple[str, Any], ...]:
         env_name = task.env_name or config.env_name
-        # Preserve the old optional force-control experiment on pick-place;
-        # normal multi-environment training uses one official policy per env.
         if config.gripper_force_control:
             if not config.pearl_expert_variants:
                 raise ValueError("--pearl-expert-variants must contain at least one force-control expert.")
@@ -686,10 +643,7 @@ def collect_feasible_dynamics_data(
         split_offset = 0 if split == "train" else 1_000_000
         seed_start = config.seed + 100_000 + split_offset + task.task_id * 1_000
         reference_seeds: list[int] = []
-        # Calibration is about force, not whether the scripted expert happened
-        # to align with a difficult random placement. First find five resets
-        # that the same object/expert solves at full grip, then compare every
-        # lower effort on exactly those resets.
+        # Compare force levels on resets already proven solvable at full grip.
         for offset in range(max_attempts * 3):
             reset_seed = seed_start + offset
             if run_expert(task, replace(expert, grip_effort=1.0), reset_seed)[1] > 0:
@@ -712,15 +666,7 @@ def collect_feasible_dynamics_data(
     def solve(
         task: TaskSpec, split: str, allowed_grips: frozenset[float] | None = None
     ) -> tuple[str | None, TaskSpec, list[Trajectory], list[Trajectory], int]:
-        """Try the expert variants in order; return the first that succeeds.
-
-        Returns (variant, task, successes, failures, attempts). With gripper
-        force control the returned task carries its calibrated grip, and the
-        trajectories are re-recorded with a common full grip after calibration,
-        so their rewards include the task's grip penalty. Earlier full-grip
-        attempts are discarded because they were collected before the penalty
-        threshold was known.
-        """
+        """Return the first feasible expert and its calibrated demonstrations."""
         all_failures: list[Trajectory] = []
         total_attempts = 0
         for name, expert in experts_for_task(task):
@@ -777,9 +723,7 @@ def collect_feasible_dynamics_data(
                             episodes.append(episode_batch(*zip(*trajectory, strict=True)))
                         for offset in range(len(episodes)):
                             contexts.add_sequence(candidate.task_id, episodes[offset:] + episodes[:offset])
-                        # Failures of rejected candidates belong to other
-                        # objects, so only the accepted one's are kept. They
-                        # include failures of every variant tried on it.
+                        # Keep failures only for the accepted object.
                         failed_trajectories[candidate.task_id] = failures
                     writer.add_scalar(f"demo/{split}_task_{candidate.task_id}_attempts", attempts, 0)
                     break
@@ -813,12 +757,7 @@ def contextualize_task_batch(
     builder: ContextBuilder,
     max_previous_episodes: int,
 ) -> tuple[TaskBatch, int]:
-    """Replace replay's random context with a deployment-shaped context.
-
-    The context for each task is built from ``k`` complete earlier episodes of
-    one stored adaptation sequence, exactly as before adaptation episode ``k``
-    at deployment. ``k = 0`` gives an empty context and ``z = 0``.
-    """
+    """Replace random replay context with prior adaptation episodes."""
     context, previous_episodes = contexts.sample(task_batch.task_ids, builder, max_previous_episodes)
     return TaskBatch(task_ids=task_batch.task_ids, context=context, rl=task_batch.rl), previous_episodes
 
@@ -857,14 +796,7 @@ def _pearl_episode(
     builder: ContextBuilder,
     rng: np.random.Generator,
 ) -> PearlEpisodeResult:
-    """Run one evaluation episode with PEARL's evaluation protocol.
-
-    As in the original PEARL, every evaluation episode samples z from the
-    current posterior (z = 0 before any context) and acts with the policy's
-    mean action. Only the context differs between adaptation steps, so a
-    change in success across steps reflects adaptation rather than a switch
-    from stochastic to deterministic actions.
-    """
+    """Run one deterministic-policy episode with a posterior-sampled latent."""
     observation = _reset_task(environment, task)
     episode_latent, context = agent.latent_for_episode(previous_episodes, builder, rng, deterministic=False)
     posterior_std = 1.0
@@ -898,7 +830,6 @@ class PearlEvaluation:
     successes: np.ndarray
     posterior_stds: np.ndarray
     context_motion_fractions: np.ndarray
-    # Success rate of each task, averaged over its sequences and steps.
     task_successes: np.ndarray
     episodes_per_step: int
 
@@ -912,11 +843,7 @@ def evaluate_pearl(
     rng: np.random.Generator,
     sequences_per_task: int = 1,
 ) -> PearlEvaluation:
-    """Measure return, success and posterior width as context accumulates.
-
-    Each task runs ``sequences_per_task`` independent adaptation sequences of
-    ``adaptation_episodes + 1`` episodes, each starting from an empty context.
-    """
+    """Measure performance and posterior width across adaptation steps."""
     if sequences_per_task < 1:
         raise ValueError("sequences_per_task must be positive.")
     steps = adaptation_episodes + 1
@@ -952,16 +879,7 @@ def seed_failed_expert_attempts(
     contexts: AdaptationContextBuffer,
     writer: SummaryWriter,
 ) -> int:
-    """Add failed expert attempts to the online replay and context buffers.
-
-    The scripted expert ignores the hidden properties, so its failures show
-    the same behavior leading to different outcomes on different objects.
-    That is the task-dependent value signal the encoder needs. They are
-    stored as ordinary experience (never behavior-cloned), and each task's
-    failures form one adaptation sequence in the order they were collected.
-    Online sequences gradually replace them in the context buffer; the
-    replay buffer keeps them.
-    """
+    """Replay failed expert attempts as experience and adaptation context."""
     transitions = 0
     for task_id, trajectories in failed_trajectories.items():
         if not trajectories:
@@ -1017,7 +935,6 @@ def train_pearl(config: TrainConfig) -> None:
         failed_trajectories = feasible_data.failed_trajectories
         if feasible_data.demonstrations is not None and feasible_data.contexts is not None:
             demonstration_data = feasible_data.demonstrations, feasible_data.contexts
-    # Property vectors of the (accepted) tasks, for reading per-task metrics.
     for split, split_tasks in (("train", task_sampler.train_tasks), ("test", task_sampler.test_tasks)):
         writer.add_text(f"tasks/{split}", "\n\n".join(str(asdict(task)) for task in split_tasks))
     agent = PEARLAgent(
@@ -1066,8 +983,6 @@ def train_pearl(config: TrainConfig) -> None:
         if config.pearl_bc_pretrain_updates < 0:
             raise ValueError("--pearl-bc-pretrain-updates must be non-negative.")
         for update in range(1, config.pearl_bc_pretrain_updates + 1):
-            # Task-agnostic warm start under z = 0. The encoder is left alone
-            # and later learns only from the critic loss and KL, as in PEARL.
             metrics = agent.behavior_clone(
                 demonstrations.sample_meta_batch(config.meta_batch_size, config.batch_size, 1)
             )
@@ -1082,8 +997,6 @@ def train_pearl(config: TrainConfig) -> None:
                 builder,
                 config.adaptation_episodes,
             )
-            # Keep the cloned actor synchronized with the encoder while the
-            # value functions warm up on demonstration-only data.
             metrics = agent.update(demonstration_batch, demonstration_batch, bc_weight=config.bc_weight)
             if update % 100 == 0 or update == config.pearl_critic_pretrain_updates:
                 writer.add_scalar("pretrain/pearl_critic_loss", metrics["loss/critic"], update)
@@ -1096,8 +1009,7 @@ def train_pearl(config: TrainConfig) -> None:
     observation = _reset_task(environment, task)
     online_contexts.begin_sequence(task.task_id)
     online_contexts.begin_episode(task.task_id)
-    # Completed episodes of the current adaptation sequence; the latent for
-    # each new episode is inferred from these, as at evaluation time.
+    # Completed episodes determine the next rollout latent.
     sequence_episodes: list[Batch] = []
     episode_transitions: list[tuple[np.ndarray, np.ndarray, float, np.ndarray, bool]] = []
     episode_latent, _ = agent.latent_for_episode(sequence_episodes, builder, rollout_rng)
@@ -1127,8 +1039,6 @@ def train_pearl(config: TrainConfig) -> None:
                 writer.add_scalar("train/episode_length", episode_length, step)
                 writer.add_scalar("train/success", float(info.get("success", False)), step)
                 writer.add_scalar("train/episode_grip_penalty", episode_grip_penalty, step)
-                # Per-task outcomes; pair with the "tasks/train" text summary
-                # to see whether failures concentrate on particular objects.
                 writer.add_scalar(f"train_task/task_{task.task_id}_success", float(info.get("success", False)), step)
                 writer.add_scalar(f"train_task/task_{task.task_id}_return", episode_return, step)
                 episodes_on_task += 1
@@ -1171,14 +1081,10 @@ def train_pearl(config: TrainConfig) -> None:
                                 concatenate_task_batch_rl(online_batch, demo_batch),
                                 demo_batch,
                                 pearl_online_bc_weight(config, step),
-                                # Full-action cloning provides the initial
-                                # reliable grip. Online, retain the expert's
-                                # motion and open/close direction while the
-                                # reward chooses how hard to squeeze.
+                                # Force-control BC preserves direction, not magnitude.
                                 clone_grip_magnitude=not config.gripper_force_control,
                             )
                 except ValueError:
-                    # Not enough task-specific data yet; keep collecting.
                     metrics = None
                 if metrics is not None:
                     for name, value in metrics.items():
@@ -1201,14 +1107,11 @@ def train_pearl(config: TrainConfig) -> None:
                     config.pearl_eval_sequences_per_task,
                 )
                 evaluation_successes = evaluation.successes
-                # Positive when context improves success. Its standard error is
-                # roughly 0.7 / sqrt(episodes_per_step) at 30% success.
                 writer.add_scalar(
                     "eval/adaptation_gain", evaluation.successes[-1] - evaluation.successes[0], step
                 )
                 writer.add_scalar("eval/success_mean", float(evaluation.successes.mean()), step)
                 writer.add_scalar("eval/episodes_per_step", evaluation.episodes_per_step, step)
-                # Not "task": that name is the training loop's current task.
                 for test_task, task_success in zip(task_sampler.test_tasks, evaluation.task_successes, strict=True):
                     writer.add_scalar(f"eval_task/task_{test_task.task_id}_success", task_success, step)
                 environment_successes: dict[str, list[float]] = defaultdict(list)
@@ -1224,7 +1127,6 @@ def train_pearl(config: TrainConfig) -> None:
                         f"eval/success_after_context_{adaptation_step}", evaluation.successes[adaptation_step], step
                     )
                     if adaptation_step > 0:
-                        # Should shrink as context accumulates if inference works.
                         writer.add_scalar(
                             f"eval/z_std_after_context_{adaptation_step}",
                             evaluation.posterior_stds[adaptation_step],
@@ -1245,8 +1147,7 @@ def train_pearl(config: TrainConfig) -> None:
             {
                 "config": asdict(config),
                 "agent": agent.state_dict(),
-                # Filtering replaces random candidates, so persist the exact
-                # accepted vectors for reproducible evaluation and recording.
+                # Persist accepted tasks because feasibility filtering resamples them.
                 "task_specs": {
                     "train": [asdict(task) for task in task_sampler.train_tasks],
                     "test": [asdict(task) for task in task_sampler.test_tasks],

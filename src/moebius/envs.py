@@ -7,14 +7,7 @@ from typing import Any, Mapping
 import gymnasium as gym
 import numpy as np
 
-# ---------------------------------------------------------------------------
-# Object shapes and hidden properties
-# ---------------------------------------------------------------------------
-
-# Every shape rests with the same (identity) orientation, so the object
-# quaternion in the observation does not reveal which shape a task uses.
-# "bar" is a box elongated along x; the gripper closes along y, so its length
-# does not change the grip width but makes off-centre grasps tilt.
+# All shapes use identity orientation; bars extend along x while fingers close along y.
 SHAPES = ("cylinder", "box", "bar", "sphere")
 SHAPE_ENVIRONMENTS = (
     "pick-place-v3",
@@ -23,17 +16,12 @@ SHAPE_ENVIRONMENTS = (
     "pick-out-of-hole-v3",
 )
 
-# MuJoCo mjtGeom values. Kept as plain integers so the geometry helpers can be
-# used (and tested) without importing MuJoCo; the environment checks them
-# against mujoco.mjtGeom when it applies a shape.
+# Plain constants keep geometry helpers independent of MuJoCo imports.
 GEOM_SPHERE = 2
 GEOM_CYLINDER = 5
 GEOM_BOX = 6
 
-# Contact observations. Pick-place observes one object, so slots 11:18 of
-# each 18-value frame (reserved by MetaWorld for a second object) are always
-# zero; with ``contact_observations`` they carry the forces on the object
-# instead. The force entries are in units of CONTACT_FORCE_SCALE newtons:
+# Reuse pick-place's empty second-object slots. Force entries are scaled newtons:
 #   11     grip-control phase (0 = closing, 1 = post-contact squeeze)
 #   12:15  total force from the fingers on the object (world x, y, z)
 #   15     magnitude of horizontal table force
@@ -42,13 +30,9 @@ GEOM_BOX = 6
 CONTACT_SLICE = slice(11, 18)
 CONTACT_LATCH_INDEX = 11
 CONTACT_FORCE_SCALE = 20.0
-# Contact readings are clipped to +-5 units (100 N). On impact the measured
-# squeeze spikes to 400-1500 N for a step; unclipped, those spikes put inputs
-# of 20-75 into the networks while every other input is about 1.
+# Clip impact spikes to keep sensor features near the state scale.
 CONTACT_FEATURE_CLIP = 5.0
-# Grip penalty: squeeze up to this multiple of a task's calibrated grip
-# (object_grip_effort) is free, which leaves room for the noise in the
-# measured squeeze.
+# Allow measurement noise above the calibrated grip.
 GRIP_SQUEEZE_TOLERANCE = 1.10
 
 
@@ -58,7 +42,6 @@ class ObjectGeometry:
 
     geom_type: int
     size: tuple[float, float, float]
-    # Axis-aligned half extents in the object frame (x, y, z).
     half_extents: tuple[float, float, float]
     bounding_radius: float
     inertia: tuple[float, float, float]
@@ -77,12 +60,7 @@ class ObjectGeometry:
 def object_geometry(
     shape: str, half_width: float, half_height: float, half_length: float | None, mass: float
 ) -> ObjectGeometry:
-    """Build a shape's geom size, bounds and principal inertia.
-
-    ``half_width`` is the half-width along the gripper's closing axis (y).
-    Spheres use it as their radius and ignore ``half_height``; only bars use
-    ``half_length`` (their half-extent along x).
-    """
+    """Build MuJoCo geometry and inertia for an object primitive."""
     if shape not in SHAPES:
         raise ValueError(f"Unknown shape {shape!r}; expected one of {SHAPES}.")
     if min(half_width, half_height, mass) <= 0:
@@ -118,15 +96,7 @@ def object_geometry(
 
 @dataclass(frozen=True)
 class ObjectPropertyBounds:
-    """Sampling ranges for task shapes and hidden physical properties.
-
-    Only properties that change how the object must be handled are hidden:
-    mass together with finger friction decides whether a grasp slips, and a
-    low table friction makes the object slide or roll away when touched.
-    These only matter when the gripper's force is limited (see
-    ``gripper_force_limit``); MetaWorld's position-servo fingers otherwise
-    squeeze far harder than any of these objects weigh.
-    """
+    """Sampling ranges for object geometry and hidden dynamics."""
 
     shapes: tuple[str, ...] = SHAPES
     half_width: tuple[float, float] = (0.015, 0.025)
@@ -176,22 +146,14 @@ def _shape_aware_pick_place_caging_reward(
     high_density: bool = False,
     medium_density: bool = False,
 ) -> float:
-    """MetaWorld's caging reward with the live object half-width.
-
-    ``SawyerPickPlaceEnvV3`` hard-codes a 0.015 m radius. This uses the current
-    object's half-width along the gripper's closing axis (y) instead, so every
-    shape and size is rewarded for the same caging geometry.
-    """
+    """MetaWorld's caging reward using the live object half-width."""
     from metaworld.utils import reward_utils
 
-    # Pick-place's specialized helper calls this method without the generic
-    # thresholds; its native values are 0.05, 0.005 and high-density shaping.
+    # Pick-place omits generic thresholds; restore its native defaults.
     pick_place_defaults = pad_success_thresh <= 0 or xz_thresh <= 0
     x_z_success_margin = 0.005 if xz_thresh <= 0 else xz_thresh
     radius = _grip_half_width(environment.model, environment.model.geom("objGeom").id)
-    # Preserve the native clearance between the object and the successful pad
-    # spacing. Using the native absolute threshold breaks when a substituted
-    # object is wider than it (notably pick-out-of-hole: 0.02 m threshold).
+    # Preserve native pad clearance as object width changes.
     native_radius = 0.015 if obj_radius <= 0 else obj_radius
     native_pad_success = 0.05 if pad_success_thresh <= 0 else pad_success_thresh
     pad_success_margin = radius + max(0.0, native_pad_success - native_radius)
@@ -227,10 +189,7 @@ def _shape_aware_pick_place_caging_reward(
         margin=tcp_obj_xz_margin,
         sigmoid="long_tail",
     )
-    # Force-controlled tasks calibrate the lowest reliable effort. Reward a
-    # complete grasp once the command reaches that effort instead of continuing
-    # to pull the policy toward a full squeeze. Regular MetaWorld tasks keep the
-    # default desired effort of 1.0.
+    # Saturate grasp reward at the calibrated effort.
     effort_override = getattr(environment, "_moebius_desired_gripper_effort", None)
     if effort_override is not None:
         desired_gripper_effort = float(effort_override)
@@ -271,38 +230,7 @@ def _rest_height(model: Any, geom_id: int) -> float:
 
 
 class MetaWorldSingleTaskEnv(gym.Wrapper[np.ndarray, np.ndarray, np.ndarray, np.ndarray]):
-    """Create one goal-observable MetaWorld task through Gymnasium.
-
-    MT1 keeps the object and goal state observable. For PEARL, a task sets the
-    pick-place object's shape, size and hidden physical properties, while its
-    task identifier stays outside the agent observation.
-
-    ``gripper_force_limit`` (newtons per finger, ``None`` = MetaWorld's
-    unlimited servo) caps the finger actuators. It is a fixed property of the
-    robot, not of a task.
-
-    ``contact_observations`` (pick-place only) puts the forces on the object
-    into observation slots 11:18 (see ``CONTACT_SLICE``), like a wrist
-    force sensor and tactile finger pads. MetaWorld moves the hand
-    kinematically, so without them a heavy and a light object look the same
-    until one slips; with them, lifting reads out the weight directly.
-
-    ``gripper_force_control`` separates closing motion from squeeze force. A
-    positive gripper action closes the fingers with one fixed, full-force
-    position-servo command until either finger first contacts the object.
-    From that contact onward, the action magnitude is the requested squeeze
-    force as a fraction of ``gripper_force_limit``. A negative action opens
-    at the same fixed drive and starts a new approach; zero applies no drive.
-
-    ``grip_penalty`` charges for squeezing harder than an object needs. A
-    task's ``object_grip_effort`` is the lowest grip the scripted expert
-    reliably succeeded with (found by the training setup); each step, the
-    reward drops by ``grip_penalty`` times the squeeze above
-    ``GRIP_SQUEEZE_TOLERANCE`` times that grip, as a fraction of the full
-    squeeze. The right grip depends on the object's hidden mass and friction,
-    and so does the reward. Tasks without a calibrated grip are not
-    penalized.
-    """
+    """MetaWorld wrapper for object geometry, dynamics, sensing, and grip control."""
 
     metadata = {"render_modes": ["human", "rgb_array"]}
     _TABLE_CONTACT_TYPE = 1 << 1
@@ -342,9 +270,7 @@ class MetaWorldSingleTaskEnv(gym.Wrapper[np.ndarray, np.ndarray, np.ndarray, np.
         self._shape_aware_reward_installed = False
         self._gripper_force_limit: float | None = None
         self._allowed_squeeze: float | None = None
-        # Contact is latched for the duration of a grasp. Without a latch, a
-        # deliberately weak squeeze that briefly loses contact would switch
-        # back to full pre-contact drive and silently rescue the grasp.
+        # Latching prevents a weak grip from regaining automatic full force.
         self._gripper_contact_latched = False
         self.unwrapped._moebius_desired_gripper_effort = None
         if grip_penalty < 0:
@@ -368,8 +294,7 @@ class MetaWorldSingleTaskEnv(gym.Wrapper[np.ndarray, np.ndarray, np.ndarray, np.
                 self._write_control_observation(frame)
                 return frame
 
-            # MetaWorld builds both the current frame and the frame-stacked
-            # previous one from this method, so both carry the control phase.
+            # MetaWorld uses this method for both frames in its observation.
             unwrapped._get_curr_obs_combined_no_goal = current_frame_with_control_state
             low = self.observation_space.low.copy()
             high = self.observation_space.high.copy()
@@ -378,8 +303,6 @@ class MetaWorldSingleTaskEnv(gym.Wrapper[np.ndarray, np.ndarray, np.ndarray, np.
                 low[np.asarray(sensor_indices) + offset] = -CONTACT_FEATURE_CLIP
                 high[np.asarray(sensor_indices) + offset] = CONTACT_FEATURE_CLIP
             self.observation_space = gym.spaces.Box(low=low, high=high, dtype=self.observation_space.dtype)
-
-    # -- model bookkeeping -------------------------------------------------
 
     def _pick_place_model_ids(self) -> None:
         """Cache pick-place ids and the nominal values this wrapper changes."""
@@ -390,7 +313,6 @@ class MetaWorldSingleTaskEnv(gym.Wrapper[np.ndarray, np.ndarray, np.ndarray, np.
         except ImportError as error:
             raise ImportError("MuJoCo is required to configure object properties.") from error
 
-        # The integer constants above must match this MuJoCo build.
         assert GEOM_SPHERE == int(mujoco.mjtGeom.mjGEOM_SPHERE)
         assert GEOM_CYLINDER == int(mujoco.mjtGeom.mjGEOM_CYLINDER)
         assert GEOM_BOX == int(mujoco.mjtGeom.mjGEOM_BOX)
@@ -403,8 +325,7 @@ class MetaWorldSingleTaskEnv(gym.Wrapper[np.ndarray, np.ndarray, np.ndarray, np.
         table_body_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "tablelink")
         if table_body_id < 0:
             raise RuntimeError("Could not find the pick-place table in the MuJoCo model.")
-        # MetaWorld renders the table top separately from its invisible group-4
-        # collision box. Use the latter so table friction affects contacts.
+        # Friction acts on MetaWorld's invisible table collision geometry.
         self._table_geom_ids = [
             geom_id
             for geom_id in range(model.ngeom)
@@ -452,12 +373,7 @@ class MetaWorldSingleTaskEnv(gym.Wrapper[np.ndarray, np.ndarray, np.ndarray, np.
     def _set_object_geometry(
         self, geom_type: int, size: np.ndarray, rbound: float, aabb: np.ndarray, bvh_aabb: np.ndarray | None
     ) -> None:
-        """Swap the object's primitive shape in the compiled model.
-
-        MuJoCo reads geom type and size at every step, so a primitive can be
-        changed in place. Its collision bounds are updated as well: the
-        bounding radius and box are what the collision broad phase tests.
-        """
+        """Swap object geometry and refresh its collision bounds."""
         model = self.unwrapped.model
         geom = self._object_geom_id
         model.geom_type[geom] = geom_type
@@ -484,13 +400,7 @@ class MetaWorldSingleTaskEnv(gym.Wrapper[np.ndarray, np.ndarray, np.ndarray, np.
         model.actuator_forcerange[self._finger_actuator_ids] = (-limit, limit)
 
     def _object_contact_forces(self) -> tuple[np.ndarray, np.ndarray, float]:
-        """Forces on the object right now: (from fingers, from table, pad squeeze).
-
-        The first two are world-frame vectors in newtons. MuJoCo's contact
-        normal points from geom1 to geom2 and a positive normal force pushes
-        geom2 along it, so the force on the object is flipped when the object
-        is geom1.
-        """
+        """Return world-frame finger/table forces and pad-normal squeeze."""
         import mujoco
 
         self._pick_place_model_ids()
@@ -526,12 +436,7 @@ class MetaWorldSingleTaskEnv(gym.Wrapper[np.ndarray, np.ndarray, np.ndarray, np.
         return self._object_contact_forces()[2]
 
     def _object_bilateral_finger_contact(self) -> bool:
-        """Whether finger geometry on both sides currently touches the object.
-
-        A valid grasp may touch a pad or the adjacent claw geometry. Requiring
-        both pad geoms simultaneously was unnecessarily brittle, while the old
-        any-contact trigger switched to squeeze control after a one-sided hit.
-        """
+        """Return whether both finger sides currently contact the object."""
         self._pick_place_model_ids()
         data = self.unwrapped.data
         right_finger_ids = set(self._finger_geom_ids[:2])
@@ -565,17 +470,8 @@ class MetaWorldSingleTaskEnv(gym.Wrapper[np.ndarray, np.ndarray, np.ndarray, np.
         elif self.gripper_force_control:
             frame[CONTACT_LATCH_INDEX] = float(self._gripper_contact_latched)
 
-    # -- tasks ---------------------------------------------------------------
-
     def set_task_properties(self, task: TaskSpec) -> None:
-        """Apply a task's object shape, size and hidden physical properties.
-
-        Friction is assigned to the table and finger collision geoms; MuJoCo
-        uses the larger of the two geoms' frictions for a contact, so the
-        object itself keeps a negligible friction to make these two task
-        properties independent. Goal tasks (``task.shape is None``) restore
-        MetaWorld's nominal object.
-        """
+        """Apply object geometry and dynamics; nominal tasks restore defaults."""
         if self.env_name not in SHAPE_ENVIRONMENTS:
             raise ValueError(f"Object shapes are supported only for {SHAPE_ENVIRONMENTS}.")
         if task.env_name is not None and task.env_name != self.env_name:
@@ -594,7 +490,6 @@ class MetaWorldSingleTaskEnv(gym.Wrapper[np.ndarray, np.ndarray, np.ndarray, np.
         if task.object_grip_effort is not None and self._gripper_force_limit is not None:
             if not 0 < task.object_grip_effort <= 1:
                 raise ValueError("object_grip_effort must be in (0, 1].")
-            # Both fingers push with grip_effort x the limit.
             self._allowed_squeeze = GRIP_SQUEEZE_TOLERANCE * task.object_grip_effort * 2 * self._gripper_force_limit
             if self.gripper_force_control:
                 self.unwrapped._moebius_desired_gripper_effort = task.object_grip_effort
@@ -635,9 +530,7 @@ class MetaWorldSingleTaskEnv(gym.Wrapper[np.ndarray, np.ndarray, np.ndarray, np.
         model.body_mass[body] = object_mass
         model.body_inertia[body] = geometry.inertia
         model.geom_friction[geom] = (1e-5, 1e-6, 1e-7)
-        # MetaWorld disables its invisible table collision box. Give it a
-        # dedicated collision type and give only the object affinity for it:
-        # the table then contacts the object, not the gripper or robot.
+        # Enable the table collision only for the object.
         model.geom_contype[self._table_geom_ids] = self._TABLE_CONTACT_TYPE
         model.geom_conaffinity[self._table_geom_ids] = 0
         model.geom_contype[geom] = base["object_contype"]
@@ -672,14 +565,10 @@ class MetaWorldSingleTaskEnv(gym.Wrapper[np.ndarray, np.ndarray, np.ndarray, np.
                 if self._object_bilateral_finger_contact():
                     self._gripper_contact_latched = True
                 precontact_closing = not self._gripper_contact_latched
-                # Before contact, magnitude must not change closing speed.
-                # After contact, it is purely the requested squeeze force.
+                # Closing is fixed-speed; post-contact magnitude selects force.
                 applied_effort = 1.0 if precontact_closing else effort
                 self._set_finger_force(applied_effort * self._gripper_force_limit)
                 action[3] = 1.0
-                # MetaWorld's caging reward follows the command actually sent
-                # to the gripper: fixed close before contact, requested effort
-                # after contact.
                 reward_action[3] = applied_effort
             elif effort < 0:
                 self._gripper_contact_latched = False
@@ -695,16 +584,11 @@ class MetaWorldSingleTaskEnv(gym.Wrapper[np.ndarray, np.ndarray, np.ndarray, np.
             bilateral_contact = self._object_bilateral_finger_contact()
             if effort > 0 and bilateral_contact:
                 self._gripper_contact_latched = True
-            # super().step built the observation before the post-step contact
-            # check above. Refresh its current frame and the saved previous
-            # frame so the actor always observes the mode actually in effect.
+            # Refresh the phase after the post-step contact check.
             self._write_control_observation(observation)
             if getattr(self.unwrapped, "_prev_obs", None) is not None:
                 self._write_control_observation(self.unwrapped._prev_obs)
-            # MetaWorld uses the gripper action in its dense caging reward. The
-            # position-servo action and post-contact force request have
-            # different meanings, so re-evaluate with the command that was
-            # physically active during this step.
+            # Recompute dense reward with the physically applied effort.
             reward, reward_info = self.unwrapped.evaluate_state(observation, reward_action)
             info.update(reward_info)
             info["gripper_precontact_closing"] = precontact_closing
@@ -713,10 +597,7 @@ class MetaWorldSingleTaskEnv(gym.Wrapper[np.ndarray, np.ndarray, np.ndarray, np.
             info["gripper_bilateral_contact"] = bilateral_contact
         info["grip_penalty"] = 0.0
         if self.grip_penalty > 0 and self._allowed_squeeze is not None and not precontact_closing:
-            # Capped at the gripper's full squeeze so impact spikes do not
-            # cost more than the step's whole reward. The first contact step
-            # is exempt: it used the automatic closing drive, not the agent's
-            # requested post-contact squeeze, so charging it would be unfair.
+            # Cap impact spikes; automatic pre-contact force is not penalized.
             squeeze = min(self.grip_force(), 2 * self._gripper_force_limit)
             excess = max(0.0, squeeze - self._allowed_squeeze)
             info["grip_penalty"] = self.grip_penalty * excess / (2 * self._gripper_force_limit)
@@ -725,12 +606,10 @@ class MetaWorldSingleTaskEnv(gym.Wrapper[np.ndarray, np.ndarray, np.ndarray, np.
 
     def reset(self, *, seed: int | None = None, options: dict[str, object] | None = None) -> tuple[np.ndarray, dict[str, object]]:
         if self.gripper_force_control:
-            # MetaWorld's reset opens the gripper; do it with full force.
             self._set_finger_force(self._gripper_force_limit)
             self._gripper_contact_latched = False
         observation, info = super().reset(seed=seed, options=options)
-        # MetaWorld's reset puts the object centre at z = 0.02. Rest the
-        # current shape on the table and keep reward baselines in sync.
+        # Rest resized objects on the table and update reward baselines.
         if self._ids_cached:
             try:
                 import mujoco
@@ -755,8 +634,6 @@ class MetaWorldSingleTaskEnv(gym.Wrapper[np.ndarray, np.ndarray, np.ndarray, np.
                     )
                     + unwrapped.heightTarget
                 )
-            # Refresh the frame-stacked previous observation too, so the first
-            # observation does not pair the new object height with the old one.
             unwrapped._prev_obs = unwrapped._get_curr_obs_combined_no_goal()
             observation = unwrapped._get_obs()
         return observation, info
@@ -764,13 +641,7 @@ class MetaWorldSingleTaskEnv(gym.Wrapper[np.ndarray, np.ndarray, np.ndarray, np.
 
 @dataclass(frozen=True)
 class TaskSpec:
-    """A task identified only by replay bookkeeping, never an agent input.
-
-    ``shape is None`` means MetaWorld's nominal object (goal tasks). Otherwise
-    the object is ``shape`` with the given sizes (metres). Optional mass and
-    friction values override the environment defaults. ``object_grip_effort``
-    is a force-control calibration used by the optional grip penalty.
-    """
+    """Task properties kept outside the agent observation."""
 
     task_id: int
     reset_seed: int | None = None
@@ -782,17 +653,11 @@ class TaskSpec:
     object_table_friction: float | None = None
     object_finger_friction: float | None = None
     object_grip_effort: float | None = None
-    # None preserves old single-environment checkpoints.
     env_name: str | None = None
 
     @classmethod
     def from_dict(cls, values: Mapping[str, Any]) -> TaskSpec:
-        """Rebuild a saved task, converting pre-shape checkpoints.
-
-        Older checkpoints stored a cylinder's radius, full height and contact
-        softness. They become a cylinder with the same size; softness is no
-        longer a task property and is dropped.
-        """
+        """Rebuild a task, converting legacy cylinder checkpoints."""
         values = dict(values)
         values.pop("object_crush_force", None)  # briefly-used fragile objects
         if "object_radius" in values:
@@ -807,12 +672,7 @@ class TaskSpec:
 
 
 class MetaWorldTaskSuite:
-    """A small pool of compatible MetaWorld environments selected by TaskSpec.
-
-    The policy still sees one common 39D observation and 4D action space. The
-    environment name is bookkeeping used only to activate the right simulator;
-    it is never appended to the observation.
-    """
+    """Compatible MetaWorld environments selected by ``TaskSpec.env_name``."""
 
     def __init__(
         self,
@@ -871,13 +731,7 @@ class MetaWorldTaskSuite:
 
 
 class GoalTaskSampler:
-    """Create seeded object-and-goal configurations for one MetaWorld task.
-
-    MetaWorld's goal-observable MT1 wrapper draws each reset configuration
-    from its RNG. Resetting with one seed per task makes a pick-and-place
-    object/goal configuration reproducible while keeping the task id out of
-    the policy interface. Test seeds are disjoint from train seeds.
-    """
+    """Create disjoint seeded train and test configurations."""
 
     def __init__(self, num_train_tasks: int, num_test_tasks: int, seed: int = 1) -> None:
         if num_train_tasks < 1 or num_test_tasks < 1:
@@ -894,12 +748,7 @@ class GoalTaskSampler:
 
 
 class DynamicsTaskSampler:
-    """Sample environment/shape combinations and optional dynamics for PEARL.
-
-    Environment/shape pairs are assigned round-robin; sizes are sampled from
-    ``bounds``. Mass and friction are sampled only when ``vary_dynamics`` is
-    true, otherwise each environment retains its nominal values.
-    """
+    """Sample balanced environment/shape tasks with optional dynamics."""
 
     def __init__(
         self,
@@ -919,8 +768,7 @@ class DynamicsTaskSampler:
         self.env_names = tuple(env_names)
         self.vary_dynamics = vary_dynamics
         shapes = self.bounds.shapes
-        # Interleave environments first so even a small evaluation set covers
-        # every environment; later cycles introduce the next shape.
+        # Cover environments before advancing to the next shape.
         combinations = tuple((env_name, shape) for shape in shapes for env_name in self.env_names)
         self.train_tasks = tuple(
             self._sample(task_id, *combinations[task_id % len(combinations)]) for task_id in range(num_train_tasks)

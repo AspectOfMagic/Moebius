@@ -15,10 +15,7 @@ from moebius.context import ContextBuilder
 from moebius.networks import ContextEncoder, QNetwork, SquashedGaussianActor, TransitionDecoder
 from moebius.replay_buffer import Batch, TaskBatch
 
-# Observation entries the auxiliary decoder predicts the one-step change of:
-# gripper opening (3), object position (4:7), object quaternion (7:11) and,
-# with contact observations, the forces on the object (11:18; always zero,
-# and so trivially predicted, without them).
+# Gripper, object pose, and optional contact features decoded one step ahead.
 DECODED_STATE = slice(3, 18)
 
 
@@ -51,13 +48,7 @@ def context_transition(
 
 
 class PEARLAgent:
-    """SAC with a latent task posterior inferred from task-specific context.
-
-    The critic loss updates both critics and the context encoder.  The actor is
-    conditioned on the inferred latent but does not backpropagate into the
-    encoder, matching PEARL's separation between task inference and policy
-    optimization.
-    """
+    """SAC conditioned on a task posterior inferred from transition context."""
 
     def __init__(
         self,
@@ -120,9 +111,7 @@ class PEARLAgent:
         self.encoder_optimizer = torch.optim.Adam(self.encoder.parameters(), lr=encoder_lr)
         if decoder_weight < 0:
             raise ValueError("decoder_weight must be non-negative.")
-        # Auxiliary transition decoder (0 disables it). It predicts the change
-        # in gripper opening, object position and object orientation, plus
-        # the scaled reward, from (s, a, z).
+        # Optional auxiliary task-inference loss.
         self.decoder_weight = decoder_weight
         self.decoder = None
         self.decoder_optimizer = None
@@ -132,9 +121,7 @@ class PEARLAgent:
                 self.device
             )
             self.decoder_optimizer = torch.optim.Adam(self.decoder.parameters(), lr=decoder_lr)
-        # alpha is expressed in scaled-reward units (the same units as Q). With
-        # automatic tuning, start small so the behavior-cloned policy is not
-        # immediately pushed toward uniform random actions.
+        # Alpha uses the same scaled-reward units as Q.
         initial_log_alpha = math.log(initial_alpha if fixed_alpha is None else fixed_alpha)
         self.log_alpha = torch.tensor(
             [initial_log_alpha], device=self.device, requires_grad=fixed_alpha is None
@@ -146,17 +133,12 @@ class PEARLAgent:
         self.gamma = gamma
         self.tau = tau
         self.kl_weight = kl_weight
-        # Nats per latent dimension that the KL term does not penalize, so the
-        # posterior is never pushed all the way back onto the prior.
         self.kl_free_bits = kl_free_bits
         self.reward_scale = reward_scale
         self.gradient_clip_norm = gradient_clip_norm
         if max_reward is not None and max_reward <= 0:
             raise ValueError("max_reward must be positive when supplied.")
-        # Upper bound on one step of the soft Bellman target: the largest
-        # scaled reward plus the largest possible entropy bonus. The squashed
-        # policy's entropy can never exceed that of a uniform distribution
-        # over the action box, sum(log(high - low)).
+        # A uniform policy over the action box has maximum entropy.
         self.max_scaled_reward = None if max_reward is None else reward_scale * max_reward
         self.max_policy_entropy = float(torch.log(action_high_tensor - action_low_tensor).sum())
         self.bc_log_std_target = -2.0
@@ -168,11 +150,7 @@ class PEARLAgent:
 
     @torch.no_grad()
     def infer_latent(self, context: np.ndarray | None, deterministic: bool = False) -> np.ndarray:
-        """Infer one task embedding. ``None``/empty context returns ``z = 0``.
-
-        The empty-context convention matches training, where ``k = 0``
-        previous episodes also uses ``z = 0``.
-        """
+        """Infer one task embedding; empty context returns ``z = 0``."""
         if context is None or len(context) == 0:
             return np.zeros(self.latent_dim, dtype=np.float32)
         context_tensor = self._tensor(np.asarray(context, dtype=np.float32)).reshape(1, -1, self.context_dim)
@@ -187,13 +165,7 @@ class PEARLAgent:
         rng: np.random.Generator,
         deterministic: bool = False,
     ) -> tuple[np.ndarray, Batch | None]:
-        """The single deployment rule for choosing an episode's task latent.
-
-        The context is built from every completed episode earlier in the same
-        adaptation sequence (none for the first episode, giving ``z = 0``).
-        Training samples contexts with the same builder and the same notion of
-        "previous episodes", so the encoder sees matching inputs.
-        """
+        """Infer a latent from earlier episodes in the adaptation sequence."""
         if not previous_episodes:
             return np.zeros(self.latent_dim, dtype=np.float32), None
         context = builder.build(previous_episodes, rng)
@@ -223,13 +195,7 @@ class PEARLAgent:
         return action.squeeze(0).cpu().numpy()
 
     def behavior_clone(self, task_batch: TaskBatch) -> dict[str, float]:
-        """Task-agnostic behavior cloning of the actor under ``z = 0``.
-
-        As in the original PEARL, the encoder is trained only by the critic
-        loss and KL term. Cloning through the encoder made ``z`` encode
-        whatever predicted expert actions, and that meaning then shifted once
-        critic training took over. ``task_batch.context`` is ignored.
-        """
+        """Clone the actor under ``z = 0`` without training the encoder."""
         observations = self._flatten(task_batch.rl.observations)
         actions = self._flatten(task_batch.rl.actions)
         latents = torch.zeros((len(observations), self.latent_dim), device=self.device)
@@ -245,11 +211,7 @@ class PEARLAgent:
         }
 
     def update_critic(self, task_batch: TaskBatch) -> dict[str, float]:
-        """Update critics and task inference without changing the actor.
-
-        This is also used for demonstration-only warm-up so online collection
-        does not begin with random value functions.
-        """
+        """Update critics and task inference without changing the actor."""
         context = self._tensor(context_from_batch(task_batch.context, self.reward_scale))
         observations = self._flatten(task_batch.rl.observations)
         actions = self._flatten(task_batch.rl.actions)
@@ -260,8 +222,7 @@ class PEARLAgent:
 
         empty_context = context.shape[1] == 0
         if empty_context:
-            # First episode of an adaptation sequence: act under z = 0 exactly
-            # as rollouts do. No encoder or KL gradient in this case.
+            # The first adaptation episode uses z = 0 and no encoder gradient.
             posterior_mean = torch.zeros((tasks, self.latent_dim), device=self.device)
             posterior_log_variance = torch.zeros_like(posterior_mean)
             latents = posterior_mean
@@ -279,8 +240,7 @@ class PEARLAgent:
             clipped_fraction = torch.zeros((), device=self.device)
             q_upper_bound = float("inf")
             if self.max_scaled_reward is not None:
-                # No return can exceed this, so bootstrapped values above it
-                # are pure over-estimation; clipping stops them compounding.
+                # Prevent impossible bootstrapped values from compounding.
                 q_upper_bound = (
                     self.max_scaled_reward + self.alpha.item() * self.max_policy_entropy
                 ) / (1 - self.gamma)
@@ -307,9 +267,7 @@ class PEARLAgent:
             with torch.no_grad():
                 decoder_metrics["loss/decoder"] = decoder_loss.item()
                 if tasks > 1:
-                    # Loss with every task given another task's latent, minus
-                    # the true loss. Positive means z carries information that
-                    # predicts this task's transitions.
+                    # Positive gain means the correct latent predicts better.
                     wrong_latents = self._expand_latents(torch.roll(latents, 1, dims=0), transitions)
                     wrong_loss = self._decoder_loss(observations, actions, wrong_latents, targets)
                     decoder_metrics["stats/decoder_z_gain"] = (wrong_loss - decoder_loss).item()
@@ -340,8 +298,7 @@ class PEARLAgent:
             metrics["stats/q_upper_bound"] = q_upper_bound
         metrics.update(decoder_metrics)
         if not empty_context:
-            # Posterior statistics are only meaningful with context; logging
-            # the k = 0 prior would mask whether inference is working.
+            # Exclude the fixed k=0 prior from inference statistics.
             metrics.update(
                 {
                     "loss/kl": kl_loss.item(),
@@ -349,8 +306,6 @@ class PEARLAgent:
                     "stats/encoder_gradient_norm": float(encoder_gradient_norm),
                     "stats/z_mean": posterior_mean.mean().item(),
                     "stats/z_std": torch.exp(0.5 * posterior_log_variance).mean().item(),
-                    # Spread of posterior means across tasks: near zero means
-                    # every task maps to the same latent.
                     "stats/z_mean_task_std": posterior_mean.std(dim=0).mean().item() if tasks > 1 else 0.0,
                 }
             )
@@ -368,7 +323,7 @@ class PEARLAgent:
         observations = self._flatten(task_batch.rl.observations)
         tasks, transitions = task_batch.rl.observations.shape[:2]
 
-        # Recompute only to obtain a current, detached task posterior for SAC's actor update.
+        # Detach task inference from the actor update.
         with torch.no_grad():
             if context.shape[1] == 0:
                 actor_task_latents = torch.zeros((tasks, self.latent_dim), device=self.device)
@@ -388,9 +343,7 @@ class PEARLAgent:
             demo_observations = self._flatten(demonstration_batch.rl.observations)
             demo_actions = self._flatten(demonstration_batch.rl.actions)
             _, demo_transitions = demonstration_batch.rl.observations.shape[:2]
-            # Deployment conditions the actor on the learner's current
-            # context. Clone expert actions under that same latent instead of
-            # a separate, clean expert-only context.
+            # Clone expert actions under the learner's current latent.
             with torch.no_grad():
                 demo_latents = self._expand_latents(actor_task_latents, demo_transitions)
             bc_loss, _, _ = self._behavior_cloning_loss(
@@ -421,8 +374,6 @@ class PEARLAgent:
             "stats/alpha": self.alpha.item(),
             "stats/q_value": q_value.mean().item(),
             "stats/q_scale": q_scale.item(),
-            # Squashed-policy entropy estimate; -action_dim * log(2) would be
-            # uniform random actions on [-1, 1]^action_dim.
             "stats/policy_entropy": -log_prob.mean().item(),
             "stats/policy_log_std": policy_log_std.mean().item(),
             "stats/actor_gradient_norm": float(actor_gradient_norm),
@@ -434,11 +385,7 @@ class PEARLAgent:
         return torch.cat((state_change, scaled_rewards), dim=-1)
 
     def _decoder_loss(self, observations: Tensor, actions: Tensor, latents: Tensor, targets: Tensor) -> Tensor:
-        """Mean squared error with each target standardized over the batch.
-
-        Object displacements are millimetres while rewards are of order one;
-        dividing by each target's (detached) batch std weights them equally.
-        """
+        """Standardized transition-prediction error."""
         scale = targets.std(dim=0, keepdim=True).clamp_min(1e-3).detach()
         prediction = self.decoder(observations, actions, latents)
         return (((prediction - targets) / scale) ** 2).mean()
@@ -482,21 +429,14 @@ class PEARLAgent:
 
         movement_error = (predicted_actions[..., :-1] - expert_actions[..., :-1]).square().sum(dim=-1)
         direction = expert_actions[..., -1].sign()
-        # A small margin teaches open versus close without pulling the policy
-        # toward the expert's force magnitude. Zero expert commands are ignored.
+        # Learn direction without cloning squeeze magnitude.
         direction_error = F.relu(0.1 - direction * predicted_actions[..., -1]).square()
         direction_error = torch.where(direction == 0, torch.zeros_like(direction_error), direction_error)
         return (movement_error + direction_error).mean() / expert_actions.shape[-1]
 
     @staticmethod
     def _normalized_sac_actor_loss(alpha: Tensor, log_prob: Tensor, q_value: Tensor) -> tuple[Tensor, Tensor]:
-        """SAC actor objective divided by the batch Q magnitude.
-
-        The division keeps the behavior-cloning term comparable in size to the
-        RL term. It must scale the entropy term too: normalizing only Q makes
-        the effective temperature ``alpha * q_scale``, which drove earlier runs
-        to near-uniform random actions.
-        """
+        """Normalize the complete SAC objective by the batch Q magnitude."""
         q_scale = q_value.detach().abs().mean().clamp_min(1.0)
         return ((alpha * log_prob - q_value) / q_scale).mean(), q_scale
 

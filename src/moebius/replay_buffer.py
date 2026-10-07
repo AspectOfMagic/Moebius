@@ -24,12 +24,7 @@ def concatenate_batches(*batches: Batch) -> Batch:
 
 @dataclass
 class TaskBatch:
-    """Independent context and RL samples for a batch of meta-training tasks.
-
-    All fields in ``context`` and ``rl`` have a leading task dimension.  The
-    samples are deliberately independent: context identifies the task, while
-    the RL batch provides the Bellman/actor updates for that inferred task.
-    """
+    """Independent context and RL samples with a leading task dimension."""
 
     task_ids: np.ndarray
     context: Batch
@@ -85,12 +80,7 @@ class ReplayBuffer:
 
 
 class MultiTaskReplayBuffer:
-    """One off-policy replay buffer per task, as required by PEARL.
-
-    A task id never appears as an input to the policy.  It is only a storage
-    key that makes it possible to sample a coherent context set and an RL
-    minibatch from the same task during meta-training.
-    """
+    """One replay buffer per task; task IDs are storage keys, not observations."""
 
     def __init__(
         self, task_ids: Iterable[int], observation_dim: int, action_dim: int, capacity: int, seed: int = 1

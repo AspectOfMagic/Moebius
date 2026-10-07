@@ -143,7 +143,6 @@ def test_object_geometry_sizes_and_inertia() -> None:
     bar = object_geometry("bar", 0.02, 0.01, 0.06, 3.0)
     assert bar.half_extents == (0.06, 0.02, 0.01)
     assert bar.grip_half_width == 0.02 and bar.rest_height == 0.01
-    # Box inertia about x uses the y and z half-extents: m (hy^2 + hz^2) / 3.
     assert np.isclose(bar.inertia[0], 3.0 * (0.02**2 + 0.01**2) / 3)
     assert np.isclose(bar.bounding_radius, np.linalg.norm((0.06, 0.02, 0.01)))
 
@@ -176,7 +175,6 @@ def test_property_bounds_read_from_config() -> None:
     bounds = ObjectPropertyBounds.from_config(config)
     assert bounds.mass == (0.3, TrainConfig().object_mass_max)
     assert bounds.shapes == ("sphere", "bar")
-    # Missing keys (older checkpoints) fall back to the defaults.
     assert ObjectPropertyBounds.from_config({}) == ObjectPropertyBounds()
 
 
@@ -208,7 +206,6 @@ def test_lowest_reliable_grip_picks_the_first_level_with_four_of_five_successes(
         return level >= 0.35
 
     assert lowest_reliable_grip(succeeds, (0.1, 0.2, 0.35, 0.5)) == 0.35
-    # Failing levels are abandoned after two failures; the reliable one stops at four successes.
     assert calls == [
         (0.1, 0),
         (0.1, 1),
@@ -227,7 +224,6 @@ def test_grip_bands_are_balanced_without_being_tied_to_shape() -> None:
     assert assignments.count("gentle") == 6
     assert assignments.count("medium") == 6
     assert assignments.count("strong") == 6
-    # Two complete nine-task cycles cover every shape/band pair twice.
     pairs = [(TrainConfig.object_shapes[i % 3], assignments[i]) for i in range(18)]
     assert len(set(pairs)) == 9
     assert all(assignments[i] != "strong" or grip_band_for_task(i, 3)[1] == frozenset((0.8,)) for i in range(18))
@@ -311,8 +307,7 @@ def test_force_control_dense_reward_uses_the_continuous_effort() -> None:
         else:
             pytest.fail("The expert never reached a state with an action-dependent caging reward.")
 
-        # This assertion concerns post-contact squeeze control. Caging alone
-        # can become reward-positive just before MuJoCo reports contact.
+        # Force the post-contact phase under test.
         environment._gripper_contact_latched = True
         next_observation, reward, _, _, info = environment.step(low_effort)
         expected = environment.unwrapped.compute_reward(low_effort, next_observation)
@@ -353,7 +348,6 @@ def test_force_control_separates_precontact_closing_from_postcontact_squeeze() -
         assert not info["gripper_contact_latched"]
         assert np.allclose(force_range, (-limit, limit))
 
-        # Only bilateral pad contact switches into squeeze control.
         environment._object_bilateral_finger_contact = lambda: True
         _, _, _, _, info = environment.step(np.array([0.0, 0.0, 0.0, requested_effort], dtype=np.float32))
         force_range = environment.unwrapped.model.actuator_forcerange[environment._finger_actuator_ids]
@@ -364,7 +358,6 @@ def test_force_control_separates_precontact_closing_from_postcontact_squeeze() -
         assert info["gripper_contact_latched"] == environment.unwrapped._prev_obs[11]
         assert np.allclose(force_range, (-requested_effort * limit, requested_effort * limit))
 
-        # Opening uses fixed drive and explicitly starts a new approach.
         environment.step(np.array([0.0, 0.0, 0.0, -0.1], dtype=np.float32))
         force_range = environment.unwrapped.model.actuator_forcerange[environment._finger_actuator_ids]
         assert not environment._gripper_contact_latched
@@ -453,11 +446,9 @@ def test_contact_observations_read_the_object_weight_from_the_table() -> None:
             for _ in range(5):  # hand stays above the object with the gripper open
                 observation, *_ = environment.step(np.array([0.0, 0.0, 0.0, -1.0], dtype=np.float32))
             forces = observation[CONTACT_SLICE] * CONTACT_FORCE_SCALE
-            # The table holds the object up with its weight; the fingers do nothing.
             assert forces[5] == pytest.approx(9.81 * mass, rel=0.2)
             assert np.allclose(forces[[0, 1, 2, 6]], 0.0, atol=1e-6)
             assert np.all(np.abs(observation[CONTACT_SLICE]) <= 5.0)
-            # The frame-stacked previous frame carries the forces too.
             assert observation[18 + 16] * CONTACT_FORCE_SCALE == pytest.approx(9.81 * mass, rel=0.2)
     finally:
         environment.close()
@@ -510,7 +501,6 @@ def test_context_builder_samples_distinct_transitions_and_prefers_object_motion(
     assert context.observations.shape == (10, 8)
     assert len(np.unique(context.observations[:, 0])) == 10
     assert builder.motion_fraction_of(context) == 0.8
-    # A pool smaller than the context size is used whole, without duplicates.
     short = builder.build([_episode(0.0, 4)], np.random.default_rng(0))
     assert sorted(short.observations[:, 0]) == [0.0, 1.0, 2.0, 3.0]
 
@@ -536,7 +526,6 @@ def test_adaptation_context_buffer_matches_deployment_history() -> None:
         seen_lengths.add(previous_episodes)
         assert batch.observations.shape[:2] == (2, 0 if previous_episodes == 0 else 5 if previous_episodes == 1 else 6)
         if previous_episodes:
-            # Episode index = obs[0] // 100 must be below k.
             assert np.all(batch.observations[..., 0] // 100 < previous_episodes)
     assert seen_lengths == {0, 1, 2}
 
@@ -685,7 +674,6 @@ def test_pearl_actor_normalization_scales_entropy_with_q() -> None:
     loss.backward()
 
     assert q_scale.item() == 50.0
-    # Entropy and Q gradients keep SAC's alpha : 1 ratio after normalization.
     assert torch.allclose(log_prob.grad, torch.full_like(log_prob, 0.1 / 50.0 / 4))
     assert torch.allclose(q_value.grad, torch.full_like(q_value, -1.0 / 50.0 / 4))
     assert torch.allclose(log_prob.grad / -q_value.grad, alpha.expand_as(log_prob))
@@ -829,7 +817,6 @@ def test_decoder_loss_trains_the_encoder_and_logs_z_gain() -> None:
     targets = agent._decoder_targets(
         observations, agent._flatten(task_batch.rl.rewards), agent._flatten(task_batch.rl.next_observations)
     )
-    # Observation entries 3..11 (the decoded slice 3:18 clipped to 12 values) plus the reward.
     assert targets.shape == (observations.shape[0], 10)
     mean, log_variance = agent.encoder(agent._tensor(context_from_batch(task_batch.context, agent.reward_scale)))
     latents = agent._expand_latents(agent._sample_latents(mean, log_variance), task_batch.rl.observations.shape[1])
@@ -867,7 +854,6 @@ def test_td_targets_are_capped_at_the_largest_achievable_return() -> None:
         max_reward=10.0,
         fixed_alpha=0.1,
     )
-    # Push the target critics far above any achievable return.
     with torch.no_grad():
         for target in (agent.target_q1, agent.target_q2):
             target.network[-1].bias.fill_(1e4)
@@ -904,7 +890,6 @@ def test_failed_expert_attempts_are_replayed_as_experience_not_demonstrations() 
 
     assert replayed == 9 and writer.scalars["demo/pearl_failed_transitions_replayed"] == 9
     assert buffer.size(0) == 9 and buffer.size(1) == 0 and buffer.size(2) == 0
-    # Both failed episodes form one adaptation sequence for task 0.
     assert contexts.max_previous_episodes(0) == 2 and contexts.max_previous_episodes(1) == 0
 
 

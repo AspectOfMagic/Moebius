@@ -89,14 +89,12 @@ def load_pearl_agent(checkpoint: dict[str, Any], environment: MetaWorldSingleTas
         latent_dim=int(config["latent_dim"]),
         hidden_dim=int(config["hidden_dim"]),
         reward_scale=float(config.get("pearl_reward_scale", 1.0)),
-        # log_alpha is restored from the checkpoint below; this only selects
-        # whether the temperature is fixed or tunable.
+        # State restoration below supplies the saved alpha value.
         fixed_alpha=None if config.get("pearl_fixed_alpha") is None else float(config["pearl_fixed_alpha"]),
         gradient_clip_norm=float(config.get("gradient_clip_norm", 10.0)),
         min_posterior_std=float(config.get("min_posterior_std", 0.05)),
         kl_weight=float(config.get("kl_weight", 0.05)),
         kl_free_bits=float(config.get("kl_free_bits", 0.1)),
-        # Checkpoints from before this option have plain critics.
         critic_layer_norm=bool(config.get("pearl_critic_layer_norm", False)),
         decoder_weight=float(config.get("pearl_decoder_weight", 0.0)),
         device=device,
@@ -164,12 +162,7 @@ def record_pearl_episode(
     fps: int,
     rotate_180: bool = False,
 ) -> tuple[float, bool]:
-    """Record one PEARL rollout on one task, using the evaluation protocol.
-
-    z is sampled from the posterior over ``previous_episodes`` (z = 0 when
-    there are none) and actions are the policy's mean. The finished episode
-    is appended to ``previous_episodes``.
-    """
+    """Record one rollout and append it to the adaptation history."""
     observation = _reset_task(environment, task)
     episode_latent, _ = agent.latent_for_episode(previous_episodes, builder, rng, deterministic=False)
     transitions = []
@@ -197,7 +190,6 @@ def record_pearl(
     task_specs: dict[str, list[dict[str, Any]]] | None = None,
 ) -> None:
     if task_specs is not None:
-        # from_dict also converts tasks saved before object shapes existed.
         test_tasks = tuple(TaskSpec.from_dict(task) for task in task_specs["test"])
     elif config.get("pearl_task_distribution", "goal") == "dynamics":
         sampler = DynamicsTaskSampler(

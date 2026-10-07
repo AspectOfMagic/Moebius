@@ -1,16 +1,4 @@
-"""Measure whether object shape and hidden properties call for different behavior.
-
-For every combination of gripper force limit, shape, and low/high values of
-each hidden property, run every scripted expert variant for a few episodes
-and record its success rate. The key output is the *adaptation gap*: success
-when the best variant is picked separately for each object, minus success of
-the single best variant used for all objects. A gap near zero means one fixed
-behavior already handles every object, so a task-inference latent has
-nothing to add.
-
-Run with ``moebius-sweep`` (see ``--help``); results are written as CSV and
-summarised on stdout.
-"""
+"""Measure whether hidden object properties require different expert behavior."""
 
 from __future__ import annotations
 
@@ -60,15 +48,7 @@ def parse_args() -> argparse.Namespace:
 def run_episode(
     environment: MetaWorldSingleTaskEnv, expert: PickPlaceExpert, lengths: list[int]
 ) -> tuple[dict[int, bool], float, float]:
-    """Return ({length: success at that step}, mean grip force, mean lift force).
-
-    Success at step ``length`` is what an episode truncated at ``length``
-    would report as its final-step success. The grip force is the pad-object
-    normal force while gripping; the lift force is the vertical force from
-    the fingers on the object while it is at least 2 cm above its start
-    (about mass x 9.81 N when held steadily). Both are in newtons, 0 if never
-    gripped or lifted.
-    """
+    """Return per-length success plus mean grip and lift forces in newtons."""
     observation, _ = environment.reset()
     start_height = observation[6]
     terminated = truncated = False
@@ -109,7 +89,6 @@ def sweep(args: argparse.Namespace) -> list[dict[str, object]]:
             args.seed,
             max_episode_steps=lengths[-1],
             gripper_force_limit=force_limit,
-            # As in training; the experts' full grip (1.0) is unchanged by it.
             gripper_force_control=force_limit is not None,
         )
         try:
@@ -145,7 +124,6 @@ def sweep(args: argparse.Namespace) -> list[dict[str, object]]:
                             "variant": variant,
                             "successes": sum(outcomes),
                             "episodes": args.episodes,
-                            # Split halves for the held-out gap (see summarize).
                             "first_half_successes": sum(outcomes[:half]),
                             "first_half_episodes": half,
                             "mean_grip_force": float(np.mean(grip_forces)) if grip_forces else 0.0,
@@ -167,15 +145,7 @@ def sweep(args: argparse.Namespace) -> list[dict[str, object]]:
 
 
 def held_out_gap(rows: list[dict[str, object]]) -> tuple[float, float, float] | None:
-    """Adaptation gap with variant choices made on one half of the episodes.
-
-    Picking the best of several noisy success estimates per object is biased
-    upward, so the in-sample gap is positive even when one variant is truly
-    best everywhere. Here both the single best variant and the per-object best
-    variants are chosen on one half of the episodes and scored on the other
-    half (then the halves swap). Returns (per-object success, best single
-    success, gap), or None with fewer than two episodes per setting.
-    """
+    """Cross-fit per-object and single-variant success to estimate adaptation gain."""
     if any(row["first_half_episodes"] < 1 or row["episodes"] - row["first_half_episodes"] < 1 for row in rows):
         return None
     halves: dict[tuple, dict[str, tuple[float, float]]] = defaultdict(dict)

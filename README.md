@@ -5,6 +5,53 @@ manipulation. It supports a single-task Soft Actor-Critic (SAC) baseline and a
 PEARL agent that adapts across object shapes, environments, and optional hidden
 object dynamics.
 
+## Project phases
+
+### Phase 1 — SAC baseline
+
+Implements state-based Soft Actor-Critic with twin critics, entropy tuning,
+replay, evaluation, TensorBoard logging, and checkpoints.
+
+### Phase 2 — PEARL task inference
+
+Adds a context encoder and latent-conditioned SAC policy. The encoder infers a
+task latent from previous `(state, action, reward, next state)` transitions and
+is evaluated on held-out tasks before and after adaptation.
+
+### Phase 3 — Expert demonstrations and imitation learning
+
+Moves the main manipulation environment to Meta-World `pick-place-v3`. Scripted expert
+rollouts warm-start the policy through behavior cloning and remain available
+during online training.
+
+### Phase 4 — Object shapes and hidden properties
+
+Adds cylinder, box, and bar objects with variable size. Tasks can also hide object
+mass and friction, while feasibility checks reject objects the expert cannot
+reliably manipulate.
+
+### Phase 5 — Environments and grip force
+
+Adds training across several related MetaWorld environments. Adds an optional
+single-environment training that lets the agent choose post-contact squeeze force,
+observe contact forces, and receive a penalty for unnecessary force.
+
+## Project specifications
+
+| Component | Tool or library | Purpose |
+| --- | --- | --- |
+| Language | Python 3.10+ | Training, evaluation, environment wrappers, and command-line tools |
+| Learning framework | PyTorch 2.2+ | SAC and PEARL networks, optimization, and checkpoint state |
+| Environments | MetaWorld with MuJoCo | State-based robot-manipulation tasks and physics simulation |
+| Environment API | Gymnasium 0.29+ | Standard observation, action, reset, and step interfaces |
+| Numerical computing | NumPy 1.24+ | Replay buffers, task sampling, observations, and metrics |
+| Performance tracking | TensorBoard 2.14+ | Training losses, returns, success rates, and latent statistics |
+| Testing | pytest 8.0+ | Unit and environment integration tests |
+
+The project learns from state observations rather than camera images. By
+default, training logs are written to `runs/`, checkpoints to `checkpoints/`,
+and recorded episodes to `videos/`.
+
 ## Setup
 
 Use Python 3.10 or newer and install the project in a virtual environment:
@@ -156,3 +203,40 @@ moebius-record \
 
 Videos are saved under `videos/`. Use `--video-dir`, `--fps`, or
 `--camera-name` to change the output directory, frame rate, or camera.
+
+## Project challenges and limitations
+
+- **Sawyer control is simplified.** MetaWorld exposes Cartesian hand motion
+  and one gripper command rather than joint-level torque control. Grip force is
+  approximated with MuJoCo actuator limits, so contact and force behavior should
+  not be treated as a validated model of a physical Sawyer robot.
+- **The task family may not require adaptation.** Similar resets and scripted
+  grasp strategies can make mass, friction, or shape changes behaviorally
+  irrelevant. Visible geometry can also reveal part of the environment before
+  the encoder receives useful interaction evidence.
+- **Latent collapse remains possible.** If the actor and critics solve every
+  task without `z`, PEARL can map all contexts to nearly the same posterior.
+  The implementation counters this with object-motion-focused context,
+  complete adaptation sequences, one fixed latent per rollout, failed expert
+  attempts, KL free bits, learnable `softplus` variance, and a posterior
+  variance floor. Behavior cloning does not train the encoder, and an optional
+  transition decoder can add task-inference pressure. These measures improve
+  the learning signal but cannot create task differences that do not affect
+  reward or optimal behavior.
+- **Force experiments are narrow and expensive.** Force control currently
+  supports only `pick-place-v3`. Expert feasibility checks and grip calibration
+  add substantial setup time, and rejecting unsolved candidates biases the
+  final task distribution toward objects the scripted experts can handle.
+- **Simulation results do not establish real-world performance.** Policies use
+  privileged state observations and have not been tested for visual perception,
+  sensor noise, hardware delay, or simulation-to-real transfer.
+
+## Relevant papers
+
+- [PEARL: Efficient Off-Policy Meta-Reinforcement Learning via Probabilistic Context Variables](https://proceedings.mlr.press/v97/rakelly19a.html)
+- [Soft Actor-Critic Algorithms and Applications](https://arxiv.org/abs/1812.05905)
+- [Meta-World: A Benchmark and Evaluation for Multi-Task and Meta Reinforcement Learning](https://arxiv.org/abs/1910.10897)
+- [Learning Complex Dexterous Manipulation with Deep Reinforcement Learning and Demonstrations](https://arxiv.org/abs/1709.10087)
+- [VariBAD: A Very Good Method for Bayes-Adaptive Deep RL via Meta-Learning](https://arxiv.org/abs/1910.08348)
+- [Layer Normalization](https://arxiv.org/abs/1607.06450)
+- [Improving Variational Inference with Inverse Autoregressive Flow](https://arxiv.org/abs/1606.04934)
