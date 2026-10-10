@@ -2,8 +2,18 @@
 
 Moebius is a state-based reinforcement-learning project for MetaWorld robot
 manipulation. It supports a single-task Soft Actor-Critic (SAC) baseline and a
-PEARL agent that adapts across object shapes, environments, and optional hidden
-object dynamics.
+Probabilistic Embeddings for Actor-Critic RL (PEARL) agent that adapts across
+object shapes, environments, and optional hidden object dynamics.
+
+## PEARL agent demonstrations
+
+### PEARL agent on the pick-and-place task
+
+![PEARL agent completing the pick-and-place task](Assets/pick-place-v3_pearl_task0_adapted.gif)
+
+### PEARL agent on the pick-and-place shelf task
+
+![PEARL agent completing the pick-and-place shelf task](Assets/shelf-place-v3_pearl_task6_adapted.gif)
 
 ## Project phases
 
@@ -197,12 +207,18 @@ held-out task:
 
 ```bash
 moebius-record \
-  --checkpoint checkpoints/pearl_multi_shape/multi-pick-place_pearl_seed1.pt \
-  --task-index 0 --adaptation-episodes 3
+  --checkpoint checkpoints/multi_shape_pearl/multi-pick-place_pearl_seed1.pt \
+  --task-index 0 --adaptation-episodes 3 \
+  --presentation-mode
 ```
 
 Videos are saved under `videos/`. Use `--video-dir`, `--fps`, or
 `--camera-name` to change the output directory, frame rate, or camera.
+Presentation mode reduces visible finger/object penetration and ends shortly
+after success. It slightly firms contact physics for the recording only, so
+omit it when an exact evaluation rollout is required. Use
+`--width 720 --height 720` for higher-resolution output, or
+`--success-hold-steps` to tune the ending.
 
 ## Project challenges and limitations
 

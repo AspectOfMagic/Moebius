@@ -4,7 +4,7 @@ import numpy as np
 import torch
 
 from moebius.pearl import PEARLAgent
-from moebius.record import checkpoint_environment_options, load_pearl_agent
+from moebius.record import _should_append_frame, checkpoint_environment_options, load_pearl_agent
 
 
 def test_force_control_checkpoint_options_apply_only_to_pearl() -> None:
@@ -14,7 +14,6 @@ def test_force_control_checkpoint_options_apply_only_to_pearl() -> None:
         "gripper_force_control": True,
         "pearl_grip_penalty": 1.0,
     }
-
     assert checkpoint_environment_options(config, "sac") == {}
     assert checkpoint_environment_options(config, "pearl") == {
         "gripper_force_limit": 60.0,
@@ -22,6 +21,13 @@ def test_force_control_checkpoint_options_apply_only_to_pearl() -> None:
         "gripper_force_control": True,
         "grip_penalty": 1.0,
     }
+
+
+def test_presentation_mode_stops_recording_after_success_hold() -> None:
+    assert _should_append_frame(10, None, True, 3)
+    assert _should_append_frame(13, 10, True, 3)
+    assert not _should_append_frame(14, 10, True, 3)
+    assert _should_append_frame(14, 10, False, 3)
 
 
 def test_load_pearl_agent_restores_encoder_and_latent_policy() -> None:

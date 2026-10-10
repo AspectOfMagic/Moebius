@@ -242,6 +242,8 @@ class MetaWorldSingleTaskEnv(gym.Wrapper[np.ndarray, np.ndarray, np.ndarray, np.
         max_episode_steps: int = 500,
         render_mode: str | None = None,
         camera_name: str | None = None,
+        render_width: int = 480,
+        render_height: int = 480,
         gripper_force_limit: float | None = None,
         contact_observations: bool = False,
         gripper_force_control: bool = False,
@@ -262,6 +264,8 @@ class MetaWorldSingleTaskEnv(gym.Wrapper[np.ndarray, np.ndarray, np.ndarray, np.
             max_episode_steps=max_episode_steps,
             render_mode=render_mode,
             camera_name=camera_name,
+            width=render_width,
+            height=render_height,
         )
         super().__init__(environment)
         self.env_name = env_name
@@ -369,6 +373,15 @@ class MetaWorldSingleTaskEnv(gym.Wrapper[np.ndarray, np.ndarray, np.ndarray, np.
             "actuator_forcerange": model.actuator_forcerange[self._finger_actuator_ids].copy(),
         }
         self._ids_cached = True
+
+    def enable_presentation_contacts(self) -> None:
+        """Reduce visible finger penetration for recorded shape-task rollouts."""
+        self._pick_place_model_ids()
+        model = self.unwrapped.model
+        contact_geoms = [self._object_geom_id, *self._finger_geom_ids]
+        model.geom_margin[contact_geoms] = np.maximum(model.geom_margin[contact_geoms], 0.003)
+        model.geom_solref[self._object_geom_id] = (0.003, 1.0)
+        model.geom_solimp[self._object_geom_id] = (0.99, 0.999, 0.001, 0.5, 2.0)
 
     def _set_object_geometry(
         self, geom_type: int, size: np.ndarray, rbound: float, aabb: np.ndarray, bvh_aabb: np.ndarray | None

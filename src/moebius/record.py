@@ -8,9 +8,16 @@ import imageio.v2 as imageio
 import numpy as np
 import torch
 
-from moebius.envs import DynamicsTaskSampler, GoalTaskSampler, MetaWorldSingleTaskEnv, ObjectPropertyBounds, TaskSpec
-from moebius.networks import SquashedGaussianActor
 from moebius.context import ContextBuilder, episode_batch
+from moebius.envs import (
+    SHAPE_ENVIRONMENTS,
+    DynamicsTaskSampler,
+    GoalTaskSampler,
+    MetaWorldSingleTaskEnv,
+    ObjectPropertyBounds,
+    TaskSpec,
+)
+from moebius.networks import SquashedGaussianActor
 from moebius.pearl import PEARLAgent
 from moebius.replay_buffer import Batch
 
@@ -48,6 +55,23 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--video-dir", type=Path, default=Path("videos"))
     parser.add_argument("--fps", type=int, default=30)
+    parser.add_argument(
+        "--width", type=int, default=None, help="Frame width; defaults to 480."
+    )
+    parser.add_argument(
+        "--height", type=int, default=None, help="Frame height; defaults to 480."
+    )
+    parser.add_argument(
+        "--presentation-mode",
+        action="store_true",
+        help="Use firmer recording-only contacts and a short ending after success.",
+    )
+    parser.add_argument(
+        "--success-hold-steps",
+        type=int,
+        default=20,
+        help="Frames to retain after first success in presentation mode.",
+    )
     parser.add_argument(
         "--camera-name",
         choices=("corner", "topview", "behindGripper", "gripperPOV", "corner2", "corner3", "corner4"),
@@ -132,6 +156,12 @@ def _append_frame(writer: imageio.Writer, environment: MetaWorldSingleTaskEnv, r
     writer.append_data(frame)
 
 
+def _should_append_frame(
+    step: int, first_success_step: int | None, presentation_mode: bool, success_hold_steps: int
+) -> bool:
+    return not presentation_mode or first_success_step is None or step <= first_success_step + success_hold_steps
+
+
 def record_sac(
     actor: SquashedGaussianActor, environment: MetaWorldSingleTaskEnv, config: dict[str, Any], args: argparse.Namespace, device: str
 ) -> None:
@@ -140,14 +170,20 @@ def record_sac(
         observation, _ = environment.reset(seed=int(config["seed"]) + episode)
         video_path = args.video_dir / f"{config['env_name']}_episode_{episode + 1}.mp4"
         episode_return = 0.0
+        first_success_step = None
+        step = 0
         terminated = truncated = False
         with imageio.get_writer(video_path, fps=args.fps) as writer:
             _append_frame(writer, environment, rotate_180)
             while not (terminated or truncated):
                 action = select_action(actor, observation, device)
-                observation, reward, terminated, truncated, _ = environment.step(action)
+                observation, reward, terminated, truncated, info = environment.step(action)
                 episode_return += reward
-                _append_frame(writer, environment, rotate_180)
+                step += 1
+                if first_success_step is None and info.get("success", False):
+                    first_success_step = step
+                if _should_append_frame(step, first_success_step, args.presentation_mode, args.success_hold_steps):
+                    _append_frame(writer, environment, rotate_180)
         print(f"saved {video_path} (return={episode_return:.1f})")
 
 
@@ -161,12 +197,16 @@ def record_pearl_episode(
     video_path: Path,
     fps: int,
     rotate_180: bool = False,
+    presentation_mode: bool = False,
+    success_hold_steps: int = 20,
 ) -> tuple[float, bool]:
     """Record one rollout and append it to the adaptation history."""
     observation = _reset_task(environment, task)
     episode_latent, _ = agent.latent_for_episode(previous_episodes, builder, rng, deterministic=False)
     transitions = []
     episode_return = 0.0
+    first_success_step = None
+    step = 0
     terminated = truncated = False
     info: dict[str, Any] = {}
     with imageio.get_writer(video_path, fps=fps) as writer:
@@ -177,7 +217,11 @@ def record_pearl_episode(
             transitions.append((observation, action, reward, next_observation, terminated))
             observation = next_observation
             episode_return += reward
-            _append_frame(writer, environment, rotate_180)
+            step += 1
+            if first_success_step is None and info.get("success", False):
+                first_success_step = step
+            if _should_append_frame(step, first_success_step, presentation_mode, success_hold_steps):
+                _append_frame(writer, environment, rotate_180)
     previous_episodes.append(episode_batch(*zip(*transitions, strict=True)))
     return episode_return, bool(info.get("success", False))
 
@@ -229,13 +273,33 @@ def record_pearl(
     for episode in range(adaptation_episodes):
         video_path = args.video_dir / f"{name_prefix}_context_{episode + 1}.mp4"
         episode_return, success = record_pearl_episode(
-            agent, environment, task, previous_episodes, builder, rng, video_path, args.fps, rotate_180=rotate_180
+            agent,
+            environment,
+            task,
+            previous_episodes,
+            builder,
+            rng,
+            video_path,
+            args.fps,
+            rotate_180=rotate_180,
+            presentation_mode=args.presentation_mode,
+            success_hold_steps=args.success_hold_steps,
         )
         print(f"saved {video_path} (context={episode + 1}, return={episode_return:.1f}, success={success})")
 
     video_path = args.video_dir / f"{name_prefix}_adapted.mp4"
     episode_return, success = record_pearl_episode(
-        agent, environment, task, previous_episodes, builder, rng, video_path, args.fps, rotate_180=rotate_180
+        agent,
+        environment,
+        task,
+        previous_episodes,
+        builder,
+        rng,
+        video_path,
+        args.fps,
+        rotate_180=rotate_180,
+        presentation_mode=args.presentation_mode,
+        success_hold_steps=args.success_hold_steps,
     )
     print(f"saved {video_path} (adapted, return={episode_return:.1f}, success={success})")
 
@@ -243,6 +307,12 @@ def record_pearl(
 def record(args: argparse.Namespace) -> None:
     if args.episodes < 1:
         raise ValueError("--episodes must be at least 1")
+    if args.success_hold_steps < 0:
+        raise ValueError("--success-hold-steps must be non-negative")
+    if args.width is not None and args.width < 1:
+        raise ValueError("--width must be positive")
+    if args.height is not None and args.height < 1:
+        raise ValueError("--height must be positive")
     if not args.checkpoint.is_file():
         raise FileNotFoundError(f"Checkpoint not found: {args.checkpoint}")
 
@@ -264,8 +334,12 @@ def record(args: argparse.Namespace) -> None:
         max_episode_steps=int(config["max_episode_steps"]),
         render_mode="rgb_array",
         camera_name=args.camera_name,
+        render_width=args.width or 480,
+        render_height=args.height or 480,
         **checkpoint_environment_options(config, algorithm),
     )
+    if args.presentation_mode and environment_name in SHAPE_ENVIRONMENTS:
+        environment.enable_presentation_contacts()
     args.video_dir.mkdir(parents=True, exist_ok=True)
 
     try:
