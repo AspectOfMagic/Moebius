@@ -9,11 +9,19 @@ object shapes, environments, and optional hidden object dynamics.
 
 ### PEARL agent on the pick-and-place task
 
-![PEARL agent completing the pick-and-place task](Assets/pick-place-v3_pearl_task0_adapted.gif)
+<img src="assets/pick-place-v3_pearl_task0_adapted.gif" alt="PEARL agent completing the pick-and-place task" width="500">
+
+### PEARL agent on the pick-and-place wall task
+
+<img src="assets/pick-place-wall-v3_pearl_task9_adapted.gif" alt="PEARL agent completing the pick-and-place wall task" width="500">
 
 ### PEARL agent on the pick-and-place shelf task
 
-![PEARL agent completing the pick-and-place shelf task](Assets/shelf-place-v3_pearl_task6_adapted.gif)
+<img src="assets/shelf-place-v3_pearl_task6_adapted.gif" alt="PEARL agent completing the pick-and-place shelf task" width="500">
+
+### PEARL agent on the pick-out-of-hole task
+
+<img src="assets/pick-out-of-hole-v3_pearl_task7_adapted.gif" alt="PEARL agent completing the pick-out-of-hole task" width="500">
 
 ## Project phases
 
